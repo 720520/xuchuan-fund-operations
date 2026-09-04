@@ -1,0 +1,15 @@
+.venv/
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.tsbuildinfo
+node_modules/
+dist/
+runtime/
+*.egg-info/
+.DS_Store
+__MACOSX/
