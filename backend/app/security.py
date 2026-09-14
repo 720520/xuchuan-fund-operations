@@ -92,6 +92,8 @@ def rights(db, user, manager_id):
             "download": False,
             "all_products": False,
             "archive": False,
+            "investor_read": False,
+            "investor_write": False,
             "roles": [],
         }
     own = next((m for m in memberships(db, user) if m.manager_id == manager_id), None)
@@ -122,6 +124,12 @@ def rights(db, user, manager_id):
         "download": is_admin or bool(own and own.can_download),
         "all_products": is_admin or bool(roles & FULL_READ) or group_access,
         "archive": is_admin or bool(roles & FULL_READ),
+        # Investor names and materials stay inside the user's own license scope.
+        # Group-wide read access is intentionally insufficient for this data.
+        "investor_read": bool(own) and (
+            is_admin or bool(roles & (OPERATORS | {"compliance"}))
+        ),
+        "investor_write": bool(own) and (is_admin or bool(roles & OPERATORS)),
         "roles": sorted(roles),
     }
 

@@ -11,6 +11,36 @@ from cryptography.fernet import Fernet, InvalidToken
 from imapclient import IMAPClient
 
 
+SAFE_FETCH_FIELDS = frozenset({"RFC822.SIZE", "INTERNALDATE", "BODY.PEEK[]"})
+
+
+class ReadOnlyIMAP:
+    """Expose only IMAP operations that cannot modify mailbox contents or flags."""
+
+    def __init__(self, client):
+        self.__client = client
+
+    def list_folders(self):
+        return self.__client.list_folders()
+
+    def select_folder(self, folder, readonly=True):
+        if readonly is not True:
+            raise PermissionError("邮箱目录只能以只读模式打开")
+        return self.__client.select_folder(folder, readonly=True)
+
+    def search(self, criteria):
+        return self.__client.search(criteria)
+
+    def fetch(self, messages, fields):
+        requested = {
+            field.decode(errors="replace") if isinstance(field, bytes) else str(field)
+            for field in fields
+        }
+        if not requested.issubset(SAFE_FETCH_FIELDS):
+            raise PermissionError("只允许读取邮件大小、到达时间和不改变已读状态的正文")
+        return self.__client.fetch(messages, fields)
+
+
 def _fernet(settings, *, create=False):
     configured = os.getenv("MAIL_ENCRYPTION_KEY")
     if configured:
@@ -67,6 +97,39 @@ def decrypt_password(settings, mailbox):
     if payload.get("mailbox_id") != mailbox.id or not payload.get("password"):
         raise ValueError("邮箱授权码与配置不匹配，请由管理员重新填写")
     return payload["password"]
+
+
+def encrypt_sensitive_value(settings, purpose, owner_id, value):
+    payload = json.dumps(
+        {"purpose": purpose, "owner_id": owner_id, "value": value},
+        separators=(",", ":"),
+    ).encode()
+    return _fernet(settings, create=True).encrypt(payload).decode()
+
+
+def decrypt_sensitive_value(settings, purpose, owner_id, ciphertext):
+    try:
+        payload = json.loads(
+            _fernet(settings).decrypt(ciphertext.encode()).decode()
+        )
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("敏感字段无法解密，请联系管理员核对加密密钥") from exc
+    if (
+        payload.get("purpose") != purpose
+        or payload.get("owner_id") != owner_id
+        or not payload.get("value")
+    ):
+        raise ValueError("敏感字段与所属记录不匹配")
+    return payload["value"]
+
+
+def mask_sensitive_value(value):
+    compact = "".join(str(value).split())
+    if len(compact) <= 4:
+        return "*" * len(compact)
+    if len(compact) <= 8:
+        return compact[:1] + "*" * (len(compact) - 3) + compact[-2:]
+    return compact[:4] + "*" * min(8, len(compact) - 8) + compact[-4:]
 
 
 def stored_config(settings, mailbox, password=None):
@@ -126,17 +189,43 @@ def open_imap(config, client_type=IMAPClient):
             client.id_(
                 {"name": "Xuchuan", "version": "0.1", "vendor": "Internal Operations"}
             )
-        yield client
+        # Callers never receive the full IMAP client. Mutating commands such as
+        # STORE, MOVE, COPY, APPEND, EXPUNGE and folder changes are not exposed.
+        yield ReadOnlyIMAP(client)
 
 
-def selectable_folders(client):
+SPECIAL_USE_FLAGS = {"\\sent", "\\drafts", "\\junk", "\\trash"}
+SPECIAL_FOLDER_NAMES = {
+    "sent",
+    "sent items",
+    "drafts",
+    "junk",
+    "junk email",
+    "spam",
+    "trash",
+    "deleted items",
+    "已发送",
+    "已发送邮件",
+    "草稿箱",
+    "垃圾邮件",
+    "垃圾箱",
+    "已删除",
+    "已删除邮件",
+}
+
+
+def selectable_folders(client, *, exclude_special=False):
     folders = []
     for flags, _, folder in client.list_folders():
         normalized = [
             flag.decode(errors="replace") if isinstance(flag, bytes) else flag
             for flag in flags
         ]
-        if "\\noselect" not in {flag.lower() for flag in normalized}:
+        normalized_flags = {flag.lower() for flag in normalized}
+        special = bool(normalized_flags & SPECIAL_USE_FLAGS) or (
+            str(folder).strip().lower() in SPECIAL_FOLDER_NAMES
+        )
+        if "\\noselect" not in normalized_flags and not (exclude_special and special):
             folders.append(folder)
     return folders
 

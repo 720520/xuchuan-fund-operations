@@ -74,7 +74,7 @@ class Product(Base):
     expected = Column(Boolean, default=True, nullable=False)
     frequency = Column(String(12), default="daily", nullable=False)
     weekday = Column(Integer, default=4, nullable=False)
-    cutoff = Column(String(5), default="11:00", nullable=False)
+    cutoff = Column(String(5), default="15:00", nullable=False)
     lifecycle_status = Column(String(20), default="active", nullable=False)
     lifecycle_date = Column(String(10), nullable=True)
     lifecycle_reason = Column(Text, nullable=True)
@@ -158,6 +158,173 @@ class Document(Base):
         ForeignKeyConstraint(
             ["parent_id", "manager_id"], ["documents.id", "documents.manager_id"]
         ),
+    )
+
+
+class DocumentMaterial(Base):
+    __tablename__ = "document_materials"
+    document_id = Column(String(36), primary_key=True)
+    manager_id = Column(String(36), nullable=False, index=True)
+    category = Column(String(40), nullable=False)
+    material_type = Column(String(50), nullable=True)
+    title = Column(String(500), nullable=True)
+    business_date = Column(String(10), nullable=True)
+    period_start = Column(String(10), nullable=True)
+    period_end = Column(String(10), nullable=True)
+    notes = Column(Text, default="", nullable=False)
+    sensitivity = Column(String(30), default="standard", nullable=False)
+    status = Column(String(20), default="organized", nullable=False)
+    confirmed_by = Column(ForeignKey("users.id"), nullable=False)
+    confirmed_at = Column(String(40), default=now, nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "manager_id"], ["documents.id", "documents.manager_id"]
+        ),
+        UniqueConstraint("document_id", "manager_id"),
+    )
+
+
+class DocumentMaterialProduct(Base):
+    __tablename__ = "document_material_products"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    document_id = Column(String(36), nullable=False)
+    product_id = Column(String(36), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "manager_id"],
+            ["document_materials.document_id", "document_materials.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        UniqueConstraint("document_id", "product_id"),
+    )
+
+
+class Investor(Base):
+    __tablename__ = "investors"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(ForeignKey("managers.id"), nullable=False, index=True)
+    investor_type = Column(String(30), nullable=False)
+    display_name = Column(String(200), nullable=False)
+    suitability_class = Column(String(20), default="unknown", nullable=False)
+    professional_investor_type = Column(String(100), nullable=True)
+    certificate_type = Column(String(50), nullable=True)
+    certificate_number_ciphertext = Column(Text, nullable=True)
+    certificate_number_masked = Column(String(100), nullable=True)
+    certificate_valid_until = Column(String(10), nullable=True)
+    nationality_or_region = Column(String(100), nullable=True)
+    contact_email = Column(String(254), nullable=True)
+    contact_phone = Column(String(50), nullable=True)
+    specific_object_status = Column(String(20), default="unknown", nullable=False)
+    specific_object_confirmed_at = Column(String(10), nullable=True)
+    risk_level = Column(String(30), nullable=True)
+    risk_assessed_at = Column(String(10), nullable=True)
+    risk_expires_at = Column(String(10), nullable=True)
+    qualified_material_status = Column(String(20), default="unknown", nullable=False)
+    qualified_material_from = Column(String(10), nullable=True)
+    qualified_material_until = Column(String(10), nullable=True)
+    profile_source_document_id = Column(String(36), nullable=True)
+    suitability_source_document_id = Column(String(36), nullable=True)
+    status = Column(String(20), default="pending", nullable=False)
+    source = Column(String(30), default="manual", nullable=False)
+    notes = Column(Text, default="", nullable=False)
+    created_by = Column(ForeignKey("users.id"), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (UniqueConstraint("id", "manager_id"),)
+
+
+class InvestorProduct(Base):
+    __tablename__ = "investor_products"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    investor_id = Column(String(36), nullable=False)
+    product_id = Column(String(36), nullable=False)
+    status = Column(String(20), default="confirmed", nullable=False)
+    created_by = Column(ForeignKey("users.id"), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["investor_id", "manager_id"], ["investors.id", "investors.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        UniqueConstraint("investor_id", "product_id"),
+    )
+
+
+class InvestorBankAccount(Base):
+    __tablename__ = "investor_bank_accounts"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False, index=True)
+    investor_id = Column(String(36), nullable=False)
+    account_name = Column(String(200), nullable=False)
+    account_number_ciphertext = Column(Text, nullable=False)
+    account_number_masked = Column(String(100), nullable=False)
+    bank_name = Column(String(200), nullable=False)
+    branch_name = Column(String(300), default="", nullable=False)
+    currency = Column(String(10), default="CNY", nullable=False)
+    status = Column(String(20), default="active", nullable=False)
+    source_document_id = Column(String(36), nullable=True)
+    created_by = Column(ForeignKey("users.id"), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("id", "manager_id"),
+        ForeignKeyConstraint(
+            ["investor_id", "manager_id"], ["investors.id", "investors.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["source_document_id", "manager_id"],
+            ["documents.id", "documents.manager_id"],
+        ),
+    )
+
+
+class InvestorBankAccountProduct(Base):
+    __tablename__ = "investor_bank_account_products"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    bank_account_id = Column(String(36), nullable=False)
+    product_id = Column(String(36), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["bank_account_id", "manager_id"],
+            ["investor_bank_accounts.id", "investor_bank_accounts.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        UniqueConstraint("bank_account_id", "product_id"),
+    )
+
+
+class DocumentMaterialInvestor(Base):
+    __tablename__ = "document_material_investors"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    document_id = Column(String(36), nullable=False)
+    investor_id = Column(String(36), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "manager_id"],
+            ["document_materials.document_id", "document_materials.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["investor_id", "manager_id"], ["investors.id", "investors.manager_id"]
+        ),
+        UniqueConstraint("document_id", "investor_id"),
     )
 
 
@@ -299,6 +466,107 @@ class MailReceipt(Base):
     )
 
 
+class MailItem(Base):
+    __tablename__ = "mail_items"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False, index=True)
+    document_id = Column(String(36), nullable=False, unique=True)
+    category = Column(String(40), nullable=False)
+    title = Column(String(500), nullable=False)
+    sender = Column(String(500), default="", nullable=False)
+    business_date = Column(String(10), nullable=True)
+    handling_mode = Column(String(20), nullable=False)
+    priority = Column(String(20), default="normal", nullable=False)
+    classification_source = Column(String(20), default="rule", nullable=False)
+    confidence = Column(Integer, default=0, nullable=False)
+    status = Column(String(20), default="received", nullable=False)
+    excerpt = Column(Text, default="", nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("id", "manager_id"),
+        ForeignKeyConstraint(
+            ["document_id", "manager_id"], ["documents.id", "documents.manager_id"]
+        ),
+    )
+
+
+class MailItemProduct(Base):
+    __tablename__ = "mail_item_products"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    mail_item_id = Column(String(36), nullable=False)
+    product_id = Column(String(36), nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["mail_item_id", "manager_id"], ["mail_items.id", "mail_items.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        UniqueConstraint("mail_item_id", "product_id"),
+    )
+
+
+class MailAction(Base):
+    __tablename__ = "mail_actions"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False, index=True)
+    mail_item_id = Column(String(36), nullable=False, unique=True)
+    suggested_action = Column(String(500), nullable=False)
+    due_at = Column(String(40), nullable=True)
+    status = Column(String(20), default="open", nullable=False)
+    assignee_id = Column(ForeignKey("users.id"), nullable=True)
+    result = Column(JSON, nullable=True)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["mail_item_id", "manager_id"], ["mail_items.id", "mail_items.manager_id"]
+        ),
+    )
+
+
 Index(
     "ix_nav_lookup", NavRecord.manager_id, NavRecord.share_id, NavRecord.valuation_date
 )
+
+
+class ReceiptPolicy(Base):
+    __tablename__ = "receipt_policies"
+    manager_id = Column(ForeignKey("managers.id"), primary_key=True)
+    enabled = Column(Boolean, default=False, nullable=False)
+    start_date = Column(String(10), nullable=False)
+    followup_time = Column(String(5), default="09:00", nullable=False)
+    last_scheduled_date = Column(String(10), nullable=True)
+    last_checked_at = Column(String(40), nullable=True)
+    error = Column(String(250), nullable=True)
+
+
+class ReceiptExpectation(Base):
+    __tablename__ = "receipt_expectations"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False)
+    product_id = Column(String(36), nullable=False)
+    share_id = Column(String(36), nullable=False)
+    valuation_date = Column(String(10), nullable=False)
+    due_date = Column(String(10), nullable=False)
+    cutoff = Column(String(5), nullable=False)
+    followup_date = Column(String(10), nullable=True)
+    followup_time = Column(String(5), nullable=False)
+    calendar_version = Column(String(40), nullable=False)
+    received_at = Column(String(40), nullable=True)
+    document_id = Column(String(36), nullable=True)
+    record_id = Column(String(36), nullable=True)
+    cancelled = Column(Boolean, default=False, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(["share_id", "manager_id", "product_id"],
+                             ["share_classes.id", "share_classes.manager_id", "share_classes.product_id"]),
+        ForeignKeyConstraint(["document_id", "manager_id"], ["documents.id", "documents.manager_id"]),
+        ForeignKeyConstraint(["record_id", "manager_id", "share_id", "valuation_date"],
+                             ["nav_records.id", "nav_records.manager_id", "nav_records.share_id", "nav_records.valuation_date"]),
+        UniqueConstraint("share_id", "valuation_date"),
+        Index("ix_receipt_pending", "manager_id", "cancelled", "received_at"),
+    )

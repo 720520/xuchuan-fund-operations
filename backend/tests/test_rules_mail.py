@@ -3,6 +3,7 @@ from email.message import EmailMessage
 
 import pytest
 from app.mail_sync import sync_mailbox
+from app.mailbox_security import open_imap
 from app.models import Document, Mailbox
 from conftest import login, nav_data, product
 from sqlalchemy import select
@@ -132,3 +133,64 @@ def test_imap_never_changes_read_flag_and_preserves_bytes(env, monkeypatch, over
     with app.state.factory() as db:
         doc = db.scalar(select(Document))
         assert (app.state.settings.storage / doc.storage_key).read_bytes() == raw
+
+
+def test_imap_connection_exposes_only_read_operations():
+    calls = []
+
+    class FullIMAP:
+        def __init__(self, host, **kwargs):
+            calls.append(("connect", host))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def login(self, *_):
+            calls.append(("login",))
+
+        def list_folders(self):
+            return [((), "/", "INBOX")]
+
+        def select_folder(self, folder, readonly=False):
+            calls.append(("select", folder, readonly))
+            return {b"UIDVALIDITY": 1}
+
+        def search(self, criteria):
+            calls.append(("search", criteria))
+            return []
+
+        def fetch(self, messages, fields):
+            calls.append(("fetch", messages, fields))
+            return {}
+
+        def delete_messages(self, *_):
+            raise AssertionError("mutation reached underlying client")
+
+        def move(self, *_):
+            raise AssertionError("mutation reached underlying client")
+
+    config = {
+        "host": "imap.example.invalid",
+        "port": 993,
+        "tls": "ssl",
+        "username": "test",
+        "password": "test-only",
+    }
+    with open_imap(config, FullIMAP) as client:
+        client.select_folder("INBOX")
+        client.fetch([1], ["BODY.PEEK[]"])
+        with pytest.raises(PermissionError):
+            client.select_folder("INBOX", readonly=False)
+        with pytest.raises(PermissionError):
+            client.fetch([1], ["BODY[]"])
+        assert not hasattr(client, "delete_messages")
+        assert not hasattr(client, "move")
+        assert not hasattr(client, "copy")
+        assert not hasattr(client, "set_flags")
+        assert not hasattr(client, "append")
+        assert not hasattr(client, "expunge")
+    assert ("select", "INBOX", True) in calls
+    assert ("fetch", [1], ["BODY.PEEK[]"]) in calls

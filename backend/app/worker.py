@@ -4,12 +4,14 @@ import signal
 import threading
 import time
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from .config import Settings
+from .calendar_refresh import refresh_official_sources
 from .db import connect, now
+from .mail_classification import classify_pending_mail
 from .mail_sync import sync_mailbox
-from .models import Document, Mailbox, ParseJob
+from .models import Document, DocumentMaterial, Mailbox, MailItem, ParseJob
 from .services import process_document, task
 
 log = logging.getLogger("xuchuan.worker")
@@ -19,9 +21,27 @@ def parse_one(factory, settings):
     job_id = None
     try:
         with factory.begin() as db:
+            allowed_documents = select(Document.id).where(
+                ~Document.id.in_(
+                    select(DocumentMaterial.document_id).where(
+                        DocumentMaterial.category != "nav_valuation"
+                    )
+                ),
+                or_(
+                    Document.parent_id.is_(None),
+                    Document.parent_id.in_(
+                        select(MailItem.document_id).where(
+                            MailItem.category == "nav_valuation"
+                        )
+                    ),
+                )
+            )
             job = db.scalar(
                 select(ParseJob)
-                .where(ParseJob.status == "queued")
+                .where(
+                    ParseJob.status == "queued",
+                    ParseJob.document_id.in_(allowed_documents),
+                )
                 .order_by(ParseJob.updated_at)
                 .with_for_update(skip_locked=True)
                 .limit(1)
@@ -111,10 +131,17 @@ def run_once(factory, settings, mail=False):
                             "exception.mail_recovered",
                             issue.id,
                         )
+    # Older archives may predate mail routing. Classify them before any queued
+    # attachment can be mistaken for a NAV candidate.
+    classify_pending_mail(factory, settings)
     for _ in range(100):
         if not parse_one(factory, settings):
             break
         parsed += 1
+    from .receipts import run_receipt_checks
+    run_receipt_checks(factory)
+    if mail:
+        refresh_official_sources(settings)
     return parsed
 
 

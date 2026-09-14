@@ -69,6 +69,8 @@ export type Permission = {
   download: boolean;
   all_products: boolean;
   archive: boolean;
+  investor_read: boolean;
+  investor_write: boolean;
   roles: string[];
 };
 export type ProductFiling = {
@@ -144,12 +146,101 @@ export type Doc = {
   source: string;
   received_at: string;
   parent_id: string | null;
-  metadata_json: { subject?: string; from?: string };
+  metadata_json: { subject?: string; from?: string; material_category?: string };
+  category?: string | null;
+  material_type?: string | null;
+  title?: string | null;
+  business_date?: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
+  notes?: string;
+  sensitivity?: "standard" | "investor_sensitive";
+  material_status?: "pending" | "organized";
+  material_revision?: number;
+  organized_at?: string | null;
+  organized_by?: string | null;
+  products?: { id: string; name: string }[];
+  product_ids?: string[];
+  investors?: { id: string; display_name: string; investor_type: string }[];
+  investor_ids?: string[];
   job: null | {
     id: string;
     status: string;
-    result: { errors?: { reason: string; candidate?: Candidate }[]; record_ids?: string[] };
+    result: {
+      errors?: { reason: string; candidate?: Candidate }[];
+      record_ids?: string[];
+      record_count?: number;
+      parser_version?: string;
+      skip_reason?: string;
+    };
   };
+};
+export type DocPage = {
+  items: Doc[];
+  total: number;
+  limit: number;
+  offset: number;
+  counts: {
+    all: number;
+    pending: number;
+    linked: number;
+    attention: number;
+  };
+};
+export type InvestorBankAccount = {
+  id: string;
+  investor_id: string;
+  account_name: string;
+  account_number_masked: string;
+  bank_name: string;
+  branch_name: string;
+  currency: string;
+  status: "active" | "inactive";
+  source_document_id?: string | null;
+  product_ids: string[];
+  revision: number;
+  created_at: string;
+  updated_at: string;
+};
+export type Investor = {
+  id: string;
+  manager_id: string;
+  investor_type:
+    | "individual"
+    | "institution"
+    | "fund_product"
+    | "asset_management"
+    | "manager_co_investment"
+    | "other";
+  display_name: string;
+  status: "pending" | "confirmed" | "historical";
+  source: "manual" | "directory_reference" | "material";
+  notes: string;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  product_ids: string[];
+  products: { id: string; name: string }[];
+  material_count: number;
+  suitability_class?: "ordinary" | "professional" | "unknown";
+  professional_investor_type?: string | null;
+  certificate_type?: string | null;
+  certificate_number_masked?: string | null;
+  certificate_valid_until?: string | null;
+  nationality_or_region?: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  specific_object_status?: string | null;
+  specific_object_confirmed_at?: string | null;
+  risk_level?: string | null;
+  risk_assessed_at?: string | null;
+  risk_expires_at?: string | null;
+  qualified_material_status?: string | null;
+  qualified_material_from?: string | null;
+  qualified_material_until?: string | null;
+  profile_source_document_id?: string | null;
+  suitability_source_document_id?: string | null;
+  bank_accounts?: InvestorBankAccount[];
 };
 export type Task = {
   id: string;
@@ -164,6 +255,13 @@ export type Task = {
   valuation_date: string | null;
   created_at: string;
   payload: {
+    expectation_id?: string;
+    due_date?: string;
+    cutoff?: string;
+    followup_date?: string;
+    followup_time?: string;
+    stage?: string;
+    last_resend?: { actor_id: string; at: string; reason: string };
     document_id?: string;
     errors?: { reason?: string; message?: string; candidate?: Candidate }[];
     error?: string;
@@ -202,6 +300,69 @@ export type Mailbox = {
   last_sync: string | null;
   error: string | null;
 };
+export type MailItem = {
+  id: string;
+  document_id: string;
+  category: string;
+  title: string;
+  sender: string;
+  business_date: string | null;
+  handling_mode: "task" | "receipt" | "pending" | "archive";
+  priority: "high" | "normal" | "low";
+  confidence: number;
+  status: "pending" | "received" | "completed";
+  revision: number;
+  excerpt: string;
+  created_at: string;
+  attachment_count: number;
+  products: { id: string; name: string }[];
+  sources: { mailbox: string; username: string; folder: string }[];
+  action: null | {
+    id: string;
+    suggested_action: string;
+    due_at: string | null;
+    status: "open" | "completed" | "cancelled";
+    revision: number;
+  };
+};
+export type MailDetail = {
+  id: string;
+  document_id: string;
+  subject: string;
+  sender: string;
+  to: string;
+  cc: string;
+  sent_at: string;
+  received_at: string;
+  body: string;
+  body_html: string | null;
+  category: string;
+  business_date: string | null;
+  sources: { mailbox: string; username: string; folder: string }[];
+  attachments: {
+    id: string;
+    filename: string;
+    size: number;
+    media_type: string;
+    sha256: string;
+  }[];
+};
+
+export const mailCategoryLabel = (s: string) =>
+  ({
+    nav_valuation: "净值 / 估值",
+    futures_settlement: "期货结算",
+    reconciliation_data: "对账 / 数据包",
+    risk_monitoring: "风险 / 投监",
+    open_day_calendar: "开放日 / 日历",
+    contract_seal: "合同 / 用印",
+    investor_redemption: "申赎 / 投资者",
+    security: "安全提醒",
+    action_required: "业务待办",
+    completion_receipt: "完成通知",
+    marketing: "营销信息",
+    unknown: "待分类",
+  })[s] || s;
 
 export const sourceLabel = (s: string) =>
   ({
@@ -210,6 +371,7 @@ export const sourceLabel = (s: string) =>
     email: "托管邮件",
     lifecycle_material: "生命周期材料",
     business_material: "业务材料",
+    directory_import: "待整理目录导入",
   })[s] || s;
 export const taskLabel = (s: string) =>
   ({

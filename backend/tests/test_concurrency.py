@@ -74,3 +74,55 @@ def test_concurrent_nav_has_one_effective_and_one_conflict(env):
             )
             == 1
         )
+
+
+def test_concurrent_resend_notes_do_not_overwrite(env):
+    from datetime import date
+    from app.receipts import check_receipts
+    app, client, ids = env
+    postgres_only(app)
+    login(client)
+    p = product(client, ids["a"])
+    with app.state.factory.begin() as db:
+        check_receipts(db, ids["a"], on_date=date(2026, 8, 28))
+    issue = client.get(f"/api/managers/{ids['a']}/tasks").json()[0]
+    barrier = Barrier(2)
+
+    def resend_as(name):
+        with TestClient(app, headers={"origin": ORIGIN}) as c:
+            login(c, name)
+            barrier.wait(timeout=10)
+            return c.post(f"/api/tasks/{issue['id']}/custodian-resend", json={
+                "revision": issue["revision"], "reason": "已在托管平台补发",
+            }).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(resend_as, ["ops", "colleague"])) == [200, 409]
+    assert client.get(f"/api/managers/{ids['a']}/tasks").json()[0]["status"] == "open"
+
+
+def test_receipt_scheduler_and_incoming_nav_share_a_lock(env):
+    from datetime import date
+    from app.receipts import check_receipts
+    from app.models import ReceiptExpectation
+    app, client, ids = env
+    postgres_only(app)
+    login(client)
+    p = product(client, ids["a"])
+    barrier = Barrier(2)
+
+    def work(kind):
+        with app.state.factory.begin() as db:
+            barrier.wait(timeout=10)
+            if kind == "schedule":
+                check_receipts(db, ids["a"], on_date=date(2026, 8, 28))
+            else:
+                add_nav(db, ids["a"], db.get(Product, p["id"]),
+                        db.get(ShareClass, p["shares"][0]["id"]), nav_data(p))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(work, ["schedule", "receive"]))
+    with app.state.factory() as db:
+        assert len(list(db.scalars(select(ReceiptExpectation)))) == 1
+        assert db.scalar(select(ReceiptExpectation)).received_at
+        assert not list(db.scalars(select(ExceptionTask).where(ExceptionTask.status != "resolved")))

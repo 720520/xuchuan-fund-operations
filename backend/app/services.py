@@ -1,7 +1,7 @@
 import hashlib
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -16,6 +16,7 @@ from .models import (
     NavRecord,
     ParseJob,
     Product,
+    ReceiptExpectation,
     ShareClass,
     ValidationRule,
 )
@@ -184,6 +185,7 @@ def change_product_lifecycle(
     product.lifecycle_updated_at = now()
     product.lifecycle_updated_by = actor.id
     if status in {"liquidated", "archived"}:
+        db.execute(update(ReceiptExpectation).where(ReceiptExpectation.product_id == product.id).values(cancelled=True))
         product.expected = False
         product.frequency = "off"
         for issue in db.scalars(
@@ -404,6 +406,8 @@ def add_nav(
             "validation": validation,
         },
     )
+    from .receipts import nav_received
+    nav_received(db, nav, actor)
     # Receipt resolves missing only; validation/conflict tasks remain independent.
     missing = db.scalar(
         select(ExceptionTask).where(
@@ -702,46 +706,5 @@ def performance(records):
 
 
 def refresh_missing(db, manager_id, on_date=None, at=None):
-    local = at or datetime.now(ZoneInfo("Asia/Shanghai"))
-    expected_date = on_date or (local.date() - timedelta(days=1))
-    while not on_date and expected_date.weekday() >= 5:
-        expected_date -= timedelta(days=1)
-    for p in db.scalars(
-        select(Product).where(
-            Product.manager_id == manager_id,
-            Product.expected.is_(True),
-            Product.lifecycle_status.notin_(["liquidated", "archived"]),
-        )
-    ):
-        if p.frequency == "off":
-            continue
-        d = expected_date
-        if p.frequency == "weekly" and not on_date:
-            d = local.date() - timedelta(days=local.weekday() + 7 - p.weekday)
-        if local.strftime("%H:%M") < p.cutoff:
-            continue
-        for share in db.scalars(
-            select(ShareClass).where(ShareClass.product_id == p.id)
-        ):
-            if not db.scalar(
-                select(NavRecord.id)
-                .where(
-                    NavRecord.share_id == share.id,
-                    NavRecord.valuation_date == d.isoformat(),
-                )
-                .limit(1)
-            ):
-                task(
-                    db,
-                    manager_id,
-                    "missing",
-                    f"missing:{share.id}:{d.isoformat()}",
-                    {
-                        "cutoff": p.cutoff,
-                        "check_date": local.date().isoformat(),
-                        "calendar": "weekdays-only; holidays require explicit date",
-                    },
-                    p.id,
-                    share.id,
-                    d.isoformat(),
-                )
+    from .receipts import check_receipts
+    return check_receipts(db, manager_id, on_date=on_date, at=at)

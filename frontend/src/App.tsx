@@ -1,15 +1,20 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { MailWorkspace } from "./mail-workspace";
+import { ReceiptSettings, type ReceiptPolicy } from "./receipt-settings";
+import { OperationCalendar } from "./operation-calendar";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   Activity,
   ArrowRight,
   Building2,
   ChartNoAxesCombined,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   ClipboardList,
   Download,
   FileText,
+  FolderOpen,
   Layers3,
   LayoutDashboard,
   LockKeyhole,
@@ -57,8 +62,6 @@ import {
   put,
   useResource,
   number,
-  previousFriday,
-  previousWeekday,
   sourceLabel,
   stageLabel,
   taskLabel,
@@ -66,7 +69,12 @@ import {
   type Audit,
   type Candidate,
   type Doc,
+  type DocPage,
   type History,
+  type Investor,
+  type InvestorBankAccount,
+  type MailDetail,
+  type MailItem,
   type Mailbox,
   type Manager,
   type Me,
@@ -74,11 +82,15 @@ import {
   type Product,
   type ProductFiling,
   type Task,
+  mailCategoryLabel,
 } from "./api";
 import {
   ActionForm,
   Field,
+  InvestorForm,
+  InvestorBankAccountForm,
   LifecycleForm,
+  MaterialForm,
   MemberForm,
   NavForm,
   ProductForm,
@@ -92,22 +104,121 @@ const navigation = [
   { id: "overview", label: "工作概览", icon: LayoutDashboard },
   { id: "products", label: "产品台账", icon: Layers3 },
   { id: "nav", label: "净值与估值", icon: ChartNoAxesCombined },
-  { id: "mail", label: "邮件归档", icon: Mail },
+  { id: "mail", label: "邮件中心", icon: Mail },
   { id: "exceptions", label: "异常中心", icon: CircleAlert },
-  { id: "upload", label: "上传与解析", icon: Upload },
+  { id: "upload", label: "资料中心", icon: FolderOpen },
   { id: "audit", label: "业务留痕", icon: ClipboardList },
   { id: "settings", label: "组织与权限", icon: Settings2 },
 ];
+
+const materialCategories = [
+  ["nav_valuation", "净值与估值"],
+  ["contract", "合同与协议"],
+  ["investor_qualification", "投资者准入与适当性"],
+  ["subscription_redemption", "认申购与赎回材料"],
+  ["filing", "产品备案与变更"],
+  ["custody_account", "托管及账户材料"],
+  ["periodic_report", "定期报告"],
+  ["risk_compliance", "风险与合规通知"],
+  ["operation_evidence", "运营处理凭证"],
+  ["other", "其他资料"],
+] as const;
+
+function materialCategoryOf(document: Doc) {
+  if (document.material_status !== "organized") return "pending";
+  const explicit = document.category || document.metadata_json.material_category;
+  if (explicit) return explicit;
+  if (document.source === "lifecycle_material") return "operation_evidence";
+  if (
+    document.job?.status === "completed" &&
+    (document.job.result.record_count || document.job.result.record_ids?.length)
+  ) return "nav_valuation";
+  return "pending";
+}
+
+function materialCategoryLabel(category: string) {
+  if (category === "pending") return "待整理";
+  return materialCategories.find(([value]) => value === category)?.[1] || "其他资料";
+}
+
+function materialProductIds(document: Doc) {
+  return document.product_ids || document.products?.map((product) => product.id) || (document.product_id ? [document.product_id] : []);
+}
+const investorTypeLabels: Record<string, string> = {
+  individual: "个人投资者",
+  institution: "机构投资者",
+  fund_product: "私募基金产品",
+  asset_management: "资管计划",
+  manager_co_investment: "管理人跟投",
+  other: "其他",
+};
+const investorStatusLabels: Record<string, string> = {
+  pending: "待核对",
+  confirmed: "已核对",
+  historical: "历史投资者",
+};
+const investorSourceLabels: Record<string, string> = {
+  manual: "人工登记",
+  directory_reference: "待整理目录索引",
+  material: "已归档材料",
+};
+const suitabilityClassLabels: Record<string, string> = {
+  ordinary: "普通投资者",
+  professional: "专业投资者",
+  unknown: "待确认",
+};
+const specificObjectStatusLabels: Record<string, string> = {
+  unknown: "待确认",
+  pending: "处理中",
+  confirmed: "已确认",
+  expired: "已失效",
+  not_applicable: "不适用",
+};
+const qualifiedMaterialStatusLabels: Record<string, string> = {
+  unknown: "待确认",
+  missing: "缺失",
+  valid: "有效",
+  expired: "已到期",
+  not_applicable: "不适用",
+};
+type InvestorChecklistItem = {
+  key: string;
+  label: string;
+  patterns: string[];
+  materialTypes?: string[];
+  investorTypes?: Investor["investor_type"][];
+  suitabilityClasses?: ("ordinary" | "professional" | "unknown")[];
+};
+const investorMaterialChecklist: InvestorChecklistItem[] = [
+  { key: "commitment", label: "合格投资者承诺函", materialTypes: ["qualified_investor_commitment"], patterns: ["合格投资者承诺"] },
+  { key: "risk", label: "风险测评问卷", materialTypes: ["risk_questionnaire"], patterns: ["风险测评", "风险评估", "评估问卷", "测评问卷"] },
+  { key: "information", label: "投资者信息表", materialTypes: ["investor_information_form"], patterns: ["投资者信息表", "投资者基本信息表"] },
+  { key: "identity", label: "个人身份证明", materialTypes: ["identity_front", "identity_back", "identity_document"], patterns: ["身份证", "身份证明", "证件照片"], investorTypes: ["individual"] },
+  { key: "assets", label: "资产规模／收入证明", materialTypes: ["asset_proof"], patterns: ["资产规模", "资产证明", "收入证明", "金融资产"], investorTypes: ["individual"] },
+  { key: "institution", label: "机构证明材料", materialTypes: ["institution_certificate"], patterns: ["营业执照", "许可证", "机构证明"], investorTypes: ["institution"] },
+  { key: "representative", label: "法人及经办人证明", materialTypes: ["representative_identity", "authorization"], patterns: ["法人身份证", "法定代表人", "经办人", "授权委托"], investorTypes: ["institution", "fund_product", "asset_management"] },
+  { key: "filing", label: "产品备案证明", materialTypes: ["product_filing_certificate"], patterns: ["备案函", "备案证明", "产品证明"], investorTypes: ["fund_product", "asset_management"] },
+  { key: "tax", label: "税收身份声明", materialTypes: ["tax_declaration"], patterns: ["税收", "税务", "居民身份声明"] },
+  { key: "professional", label: "专业投资者证明", materialTypes: ["professional_investor_proof"], patterns: ["专业投资者"], suitabilityClasses: ["professional", "unknown"] },
+  { key: "specific", label: "特定对象确认材料", materialTypes: ["special_object_confirmation"], patterns: ["特定对象"] },
+];
+type InvestorDetailTab = "basic" | "suitability" | "accounts" | "general" | "business";
 type Modal =
   | { kind: "product"; candidate?: Candidate; documentId?: string }
   | { kind: "filing" }
   | { kind: "nav"; task?: Task }
-  | { kind: "upload" }
+  | { kind: "upload"; productId?: string; investorId?: string }
+  | { kind: "material"; document: Doc }
+  | { kind: "investor"; investor?: Investor }
+  | { kind: "bank-account"; investor: Investor; account?: InvestorBankAccount }
   | { kind: "schedule"; product: Product }
   | { kind: "lifecycle"; product: Product }
   | { kind: "member"; member?: Member }
   | { kind: "task"; task: Task }
   | { kind: "mailbox"; mailbox?: Mailbox }
+  | { kind: "mail-action"; item: MailItem }
+  | { kind: "mail-classify"; item: MailItem }
+  | { kind: "mail-detail"; item: MailItem }
   | { kind: "check" }
   | { kind: "share"; product: Product }
   | { kind: "password" }
@@ -168,6 +279,117 @@ function ErrorNote({ error }: { error?: string }) {
       {error}
     </p>
   ) : null;
+}
+
+function scrollableMailHtml(source: string) {
+  if (source.includes('id="xuchuan-mail-scroll"')) return source;
+  const viewerStyle =
+    "<style>html,body{width:100%!important;height:100%!important;overflow:hidden!important}" +
+    "#xuchuan-mail-scroll{box-sizing:border-box;width:100%;height:100vh;max-width:none!important;" +
+    "margin:0!important;padding:24px;overflow:auto!important;scrollbar-gutter:stable}" +
+    "#xuchuan-mail-scroll::-webkit-scrollbar{width:12px;height:12px}" +
+    "#xuchuan-mail-scroll::-webkit-scrollbar-thumb{background:#a8aa9f;border-radius:8px}</style>";
+  const withStyle = source.replace(/<\/head>/i, `${viewerStyle}</head>`);
+  return withStyle
+    .replace(/<body([^>]*)>/i, '<body$1><div id="xuchuan-mail-scroll">')
+    .replace(/<\/body>/i, "</div></body>");
+}
+
+function MailDetailView({ item, canDownload }: { item: MailItem; canDownload: boolean }) {
+  const state = useResource<MailDetail>(`/mail-items/${item.id}`, item.revision);
+  const [bodyMode, setBodyMode] = useState<"html" | "text">("html");
+  const bodyFrame = useRef<HTMLIFrameElement>(null);
+  function scrollHtmlBody(distance: number) {
+    const frame = bodyFrame.current;
+    const scrollArea = frame?.contentDocument?.getElementById("xuchuan-mail-scroll");
+    if (scrollArea) scrollArea.scrollBy({ left: distance, behavior: "smooth" });
+  }
+  if (state.loading && !state.data) return <p className="loading-copy">正在读取邮件原件…</p>;
+  if (state.error) return <ErrorNote error={state.error} />;
+  const detail = state.data;
+  if (!detail) return null;
+  return (
+    <div className="mail-detail">
+      <header className="mail-detail-message-head">
+        <span aria-hidden="true"><Mail size={18} /></span>
+        <div>
+          <h3>{detail.subject}</h3>
+          <p>{detail.sender || "发件人未提供"}</p>
+        </div>
+      </header>
+      <dl className="mail-detail-meta">
+        <div><dt>发件人</dt><dd>{detail.sender || "未提供"}</dd></div>
+        <div><dt>收件人</dt><dd>{detail.to || "未提供"}</dd></div>
+        {detail.cc && <div><dt>抄送</dt><dd>{detail.cc}</dd></div>}
+        <div><dt>邮件时间</dt><dd>{detail.sent_at || "未提供"}</dd></div>
+        <div><dt>系统收到</dt><dd>{timestamp(detail.received_at)}</dd></div>
+        <div>
+          <dt>来源</dt>
+          <dd>{detail.sources.map((source) => `${source.mailbox} / ${source.folder}`).join("；") || "来源待补"}</dd>
+        </div>
+        <div><dt>分类</dt><dd>{mailCategoryLabel(detail.category)}</dd></div>
+      </dl>
+      <section className="mail-detail-section">
+        <div className="mail-detail-heading">
+          <h3>正文</h3>
+          <div className="mail-detail-tools">
+            {detail.body_html && (
+              <>
+                {bodyMode === "html" && (
+                  <div className="mail-horizontal-controls" aria-label="横向移动正文">
+                    <button type="button" onClick={() => scrollHtmlBody(-360)}><ChevronLeft size={14} />左移</button>
+                    <button type="button" onClick={() => scrollHtmlBody(360)}>右移<ChevronRight size={14} /></button>
+                  </div>
+                )}
+                <div className="mail-body-switch" aria-label="正文显示方式">
+                  <button type="button" aria-pressed={bodyMode === "html"} className={bodyMode === "html" ? "active" : ""} onClick={() => setBodyMode("html")}>原始排版</button>
+                  <button type="button" aria-pressed={bodyMode === "text"} className={bodyMode === "text" ? "active" : ""} onClick={() => setBodyMode("text")}>纯文本</button>
+                </div>
+              </>
+            )}
+            {canDownload && <a className="text-link" href={`/api/documents/${detail.document_id}/download`}>下载邮件原件</a>}
+          </div>
+        </div>
+        {detail.body_html && bodyMode === "html" ? (
+          <iframe
+            ref={bodyFrame}
+            className="mail-detail-html"
+            title={`邮件正文：${detail.subject}`}
+            sandbox="allow-same-origin"
+            scrolling="yes"
+            referrerPolicy="no-referrer"
+            srcDoc={scrollableMailHtml(detail.body_html)}
+          />
+        ) : (
+          <pre className="mail-detail-body">{detail.body || "（邮件没有可显示的文本正文，请查看附件或下载原件。）"}</pre>
+        )}
+      </section>
+      <section className="mail-detail-section">
+        <div className="mail-detail-heading">
+          <h3>附件</h3>
+          <span>{detail.attachments.length} 个</span>
+        </div>
+        {detail.attachments.length ? (
+          <div className="mail-attachment-list">
+            {detail.attachments.map((attachment) => (
+              <article key={attachment.id}>
+                <FileText size={17} />
+                <div>
+                  <strong>{attachment.filename}</strong>
+                  <small>{attachment.media_type} · {(attachment.size / 1024).toFixed(1)} KB</small>
+                </div>
+                {canDownload ? (
+                  <a className="icon-link" aria-label={`下载 ${attachment.filename}`} href={`/api/documents/${attachment.id}/download`}>
+                    <Download size={15} />
+                  </a>
+                ) : <small>无下载权限</small>}
+              </article>
+            ))}
+          </div>
+        ) : <p className="inline-note">这封邮件没有归档附件。</p>}
+      </section>
+    </div>
+  );
 }
 
 export default function App() {
@@ -268,14 +490,27 @@ function Workspace({
     [modal, setModal] = useState<Modal | null>(null),
     [feedback, setFeedback] = useState(""),
     [search, setSearch] = useState(""),
+    [materialSection, setMaterialSection] = useState<"relations" | "documents" | "pending">("relations"),
+    [materialPerspective, setMaterialPerspective] = useState<"product" | "investor">("product"),
+    [investorDetailTab, setInvestorDetailTab] = useState<InvestorDetailTab>("basic"),
+    [materialEntitySearch, setMaterialEntitySearch] = useState(""),
+    [materialOnlyAttention, setMaterialOnlyAttention] = useState(false),
+    [materialFilter, setMaterialFilter] = useState("all"),
+    [materialProduct, setMaterialProduct] = useState(""),
+    [materialInvestor, setMaterialInvestor] = useState(""),
+    [materialCategory, setMaterialCategory] = useState(""),
+    [materialSource, setMaterialSource] = useState(""),
+    [materialSensitivity, setMaterialSensitivity] = useState(""),
+    [materialPage, setMaterialPage] = useState(0),
     [showHiddenProducts, setShowHiddenProducts] = useState(false),
     [selectedProduct, setSelectedProduct] = useState(""),
     [selectedShare, setSelectedShare] = useState(""),
     [period, setPeriod] = useState("all");
-  const [checkDate, setCheckDate] = useState(previousWeekday());
+  const [checkDate, setCheckDate] = useState("");
   const manager = me.managers.find((m) => m.id === managerId),
     perm = manager?.permissions;
   const base = manager ? `/managers/${manager.id}` : null;
+  const materialPageSize = 50;
   const productsState = useResource<Product[]>(
     base && (perm?.read || perm?.admin)
       ? base + (perm?.read ? "/products" : "/product-settings")
@@ -307,13 +542,49 @@ function Workspace({
     base && (perm?.archive || perm?.admin) ? base + "/mailboxes" : null,
     revision,
   );
+  const investorsState = useResource<Investor[]>(
+    base && perm?.investor_read ? base + "/investors" : null,
+    revision,
+  );
+  const materialProducts = productsState.data || [];
+  const materialInvestors = investorsState.data || [];
+  const effectiveMaterialSection = perm?.investor_read ? materialSection : materialSection === "relations" ? "documents" : materialSection;
+  const primaryMaterialProduct = materialProduct || materialProducts[0]?.id || "";
+  const primaryMaterialInvestor = materialInvestor || materialInvestors[0]?.id || "";
+  const effectiveMaterialProduct = effectiveMaterialSection === "relations"
+    ? materialPerspective === "product" ? primaryMaterialProduct : materialProduct
+    : materialProduct;
+  const effectiveMaterialInvestor = effectiveMaterialSection === "relations"
+    ? materialPerspective === "investor" ? primaryMaterialInvestor : materialInvestor
+    : materialInvestor;
+  const materialParams = new URLSearchParams({
+    paginated: "true",
+    limit: String(materialPageSize),
+    offset: String(materialPage * materialPageSize),
+    status: effectiveMaterialSection === "pending" ? "pending" : materialFilter,
+  });
+  if (effectiveMaterialProduct) materialParams.set("product_id", effectiveMaterialProduct);
+  if (effectiveMaterialInvestor) materialParams.set("investor_id", effectiveMaterialInvestor);
+  if (materialCategory) materialParams.set("category", materialCategory);
+  if (materialSource) materialParams.set("source", materialSource);
+  if (materialSensitivity) materialParams.set("sensitivity", materialSensitivity);
+  if (search.trim()) materialParams.set("q", search.trim());
+  const materialPageState = useResource<DocPage>(
+    base && perm?.archive && view === "upload"
+      ? `${base}/documents?${materialParams.toString()}`
+      : null,
+    revision,
+  );
+  const receiptState = useResource<ReceiptPolicy>(base && perm?.read ? base + "/receipt-policy" : null, revision);
+  const suggestedDate = receiptState.data?.suggested_valuation_date || "";
+  const effectiveCheckDate = checkDate || suggestedDate;
   const summaryState = useResource<{
     expected: number;
     received: number;
     confirmed: number;
     processed_today: number | null;
     archived: number | null;
-  }>(base && perm?.read ? base + `/summary?valuation_date=${checkDate}` : null, revision);
+  }>(base && perm?.read && effectiveCheckDate ? base + `/summary?valuation_date=${effectiveCheckDate}` : null, revision);
   const rulesState = useResource<{ max_nav_change: string | null }>(
     base ? base + "/rules" : null,
     revision,
@@ -325,6 +596,7 @@ function Workspace({
     tasks = tasksState.data || [],
     members = membersState.data || [],
     boxes = boxesState.data || [];
+  const investors = investorsState.data || [];
   const p = displayedProducts.find((p) => p.id === selectedProduct) || displayedProducts[0],
     share = p?.shares.find((s) => s.id === selectedShare) || p?.shares[0];
   const historyState = useResource<History>(
@@ -351,6 +623,18 @@ function Workspace({
     setSelectedShare("");
     setModal(null);
     setSearch("");
+    setMaterialSection("relations");
+    setMaterialPerspective("product");
+    setInvestorDetailTab("basic");
+    setMaterialEntitySearch("");
+    setMaterialOnlyAttention(false);
+    setMaterialFilter("all");
+    setMaterialProduct("");
+    setMaterialInvestor("");
+    setMaterialCategory("");
+    setMaterialSource("");
+    setMaterialSensitivity("");
+    setMaterialPage(0);
     setShowHiddenProducts(false);
     setFeedback("");
     setView("overview");
@@ -394,6 +678,318 @@ function Workspace({
       ),
     ).values(),
   );
+  const productNames = new Map(products.map((product) => [product.id, product.name]));
+  const materialDocuments = docs.filter((document) => !document.filename.toLowerCase().endsWith(".eml"));
+  const unorganizedMaterials = materialDocuments.filter((document) => document.material_status !== "organized");
+  const linkedMaterials = materialDocuments.filter((document) =>
+    materialProductIds(document).length > 0 || (document.investor_ids?.length || 0) > 0,
+  );
+  const attentionMaterials = materialDocuments.filter((document) =>
+    ["queued", "processing", "review"].includes(document.job?.status || ""),
+  );
+  const materialCounts = materialPageState.data?.counts || {
+    all: materialDocuments.length,
+    pending: unorganizedMaterials.length,
+    linked: linkedMaterials.length,
+    attention: attentionMaterials.length,
+  };
+  const filteredMaterials = materialPageState.data?.items || [];
+  const filteredMaterialTotal = materialPageState.data?.total || 0;
+  const materialNeedsAttention = (document: Doc) =>
+    document.material_status !== "organized" ||
+    ["queued", "processing", "review"].includes(document.job?.status || "");
+  const documentsFor = (productId?: string, investorId?: string) =>
+    materialDocuments.filter((document) =>
+      (!productId || materialProductIds(document).includes(productId)) &&
+      (!investorId || (document.investor_ids || []).includes(investorId)),
+    );
+  const productEntities = products.map((product) => {
+    const entityDocuments = documentsFor(product.id);
+    const relatedInvestorIds = new Set(
+      investors
+        .filter((investor) => investor.product_ids.includes(product.id))
+        .map((investor) => investor.id),
+    );
+    entityDocuments.forEach((document) =>
+      (document.investor_ids || []).forEach((id) => relatedInvestorIds.add(id)),
+    );
+    return {
+      ...product,
+      relationCount: relatedInvestorIds.size,
+      materialCount: entityDocuments.length,
+      attentionCount: entityDocuments.filter(materialNeedsAttention).length,
+    };
+  });
+  const investorEntities = investors.map((investor) => {
+    const entityDocuments = documentsFor(undefined, investor.id);
+    const relatedProductIds = new Set(investor.product_ids);
+    entityDocuments.forEach((document) =>
+      materialProductIds(document).forEach((id) => relatedProductIds.add(id)),
+    );
+    return {
+      ...investor,
+      relationCount: relatedProductIds.size,
+      materialCount: entityDocuments.length,
+      attentionCount:
+        entityDocuments.filter(materialNeedsAttention).length + (investor.status === "pending" ? 1 : 0),
+    };
+  });
+  const selectedWorkbenchProduct =
+    productEntities.find((product) => product.id === primaryMaterialProduct) || productEntities[0];
+  const selectedWorkbenchInvestor =
+    investorEntities.find((investor) => investor.id === primaryMaterialInvestor) || investorEntities[0];
+  const searchedProductEntities = productEntities.filter((product) =>
+    `${product.name} ${product.code}`.toLowerCase().includes(materialEntitySearch.trim().toLowerCase()) &&
+    (!materialOnlyAttention || product.attentionCount > 0),
+  );
+  const searchedInvestorEntities = investorEntities.filter((investor) =>
+    `${investor.display_name} ${investorTypeLabels[investor.investor_type]} ${investor.products.map((product) => product.name).join(" ")}`
+      .toLowerCase()
+      .includes(materialEntitySearch.trim().toLowerCase()) &&
+    (!materialOnlyAttention || investor.attentionCount > 0),
+  );
+  const relatedWorkbenchInvestors = selectedWorkbenchProduct
+    ? investorEntities
+        .filter((investor) =>
+          investor.product_ids.includes(selectedWorkbenchProduct.id) ||
+          documentsFor(selectedWorkbenchProduct.id, investor.id).length > 0,
+        )
+        .map((investor) => {
+          const commonDocuments = documentsFor(selectedWorkbenchProduct.id, investor.id);
+          return {
+            ...investor,
+            commonMaterialCount: commonDocuments.length,
+            commonAttentionCount: commonDocuments.filter(materialNeedsAttention).length,
+          };
+        })
+    : [];
+  const relatedWorkbenchProducts = selectedWorkbenchInvestor
+    ? productEntities
+        .filter((product) =>
+          selectedWorkbenchInvestor.product_ids.includes(product.id) ||
+          documentsFor(product.id, selectedWorkbenchInvestor.id).length > 0,
+        )
+        .map((product) => {
+          const commonDocuments = documentsFor(product.id, selectedWorkbenchInvestor.id);
+          return {
+            ...product,
+            commonMaterialCount: commonDocuments.length,
+            commonAttentionCount: commonDocuments.filter(materialNeedsAttention).length,
+          };
+        })
+    : [];
+  const selectedRelatedInvestor = relatedWorkbenchInvestors.find((investor) => investor.id === materialInvestor);
+  const selectedRelatedProduct = relatedWorkbenchProducts.find((product) => product.id === materialProduct);
+  const selectedInvestorDocuments = selectedWorkbenchInvestor
+    ? documentsFor(undefined, selectedWorkbenchInvestor.id)
+    : [];
+  const selectedInvestorGeneralDocuments = selectedInvestorDocuments.filter(
+    (document) =>
+      materialCategoryOf(document) === "investor_qualification" ||
+      materialProductIds(document).length === 0,
+  );
+  const selectedInvestorBusinessDocuments =
+    selectedWorkbenchInvestor && selectedRelatedProduct
+      ? documentsFor(selectedRelatedProduct.id, selectedWorkbenchInvestor.id).filter(
+          (document) => materialCategoryOf(document) !== "investor_qualification",
+        )
+      : [];
+  const selectedInvestorChecklist = investorMaterialChecklist
+    .filter(
+      (item) =>
+        selectedWorkbenchInvestor &&
+        (!item.investorTypes || item.investorTypes.includes(selectedWorkbenchInvestor.investor_type)) &&
+        (!item.suitabilityClasses ||
+          item.suitabilityClasses.includes(selectedWorkbenchInvestor.suitability_class || "unknown")),
+    )
+    .map((item) => ({
+      ...item,
+      documents: selectedInvestorDocuments.filter((document) => {
+        const haystack = (document.filename + " " + (document.title || "")).toLowerCase();
+        return Boolean(
+          (document.material_type && item.materialTypes?.includes(document.material_type)) ||
+          item.patterns.some((pattern) => haystack.includes(pattern.toLowerCase())),
+        );
+      }),
+    }));
+
+  function resetMaterialFilters() {
+    setMaterialCategory("");
+    setMaterialSource("");
+    setMaterialSensitivity("");
+    setSearch("");
+    setMaterialPage(0);
+  }
+
+  function renderMaterialFilters(includeSubjects: boolean) {
+    return (
+      <div className="material-workbench-filters">
+        {includeSubjects && (
+          <>
+            <select aria-label="按产品筛选资料" value={materialProduct} onChange={(event) => {
+              setMaterialProduct(event.target.value);
+              setMaterialPage(0);
+            }}>
+              <option value="">全部产品</option>
+              {products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
+            </select>
+            {perm?.investor_read && (
+              <select aria-label="按投资者筛选资料" value={materialInvestor} onChange={(event) => {
+                setMaterialInvestor(event.target.value);
+                setMaterialPage(0);
+              }}>
+                <option value="">全部投资者</option>
+                {investors.map((investor) => <option key={investor.id} value={investor.id}>{investor.display_name}</option>)}
+              </select>
+            )}
+          </>
+        )}
+        <select aria-label="按资料类别筛选" value={materialCategory} onChange={(event) => {
+          setMaterialCategory(event.target.value);
+          setMaterialPage(0);
+        }}>
+          <option value="">全部类别</option>
+          <option value="pending">待整理</option>
+          {materialCategories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+        <select aria-label="按资料来源筛选" value={materialSource} onChange={(event) => {
+          setMaterialSource(event.target.value);
+          setMaterialPage(0);
+        }}>
+          <option value="">全部来源</option>
+          <option value="email">邮件附件</option>
+          <option value="upload">手动上传</option>
+          <option value="directory_import">待整理目录导入</option>
+          <option value="lifecycle_material">生命周期材料</option>
+        </select>
+        {perm?.investor_read && (
+          <select aria-label="按敏感级别筛选资料" value={materialSensitivity} onChange={(event) => {
+            setMaterialSensitivity(event.target.value);
+            setMaterialPage(0);
+          }}>
+            <option value="">全部敏感级别</option>
+            <option value="standard">普通业务资料</option>
+            <option value="investor_sensitive">投资者敏感资料</option>
+          </select>
+        )}
+        <div className="search-inline">
+          <Search size={15} />
+          <Input
+            aria-label="搜索资料"
+            placeholder="搜索标题或文件名"
+            value={search}
+            onChange={(event) => {
+              setSearch(event.target.value);
+              setMaterialPage(0);
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  function renderMaterialTable(relationMode: boolean, documentsOverride?: Doc[]) {
+    const displayedMaterials = documentsOverride ?? filteredMaterials;
+    const displayedTotal = documentsOverride?.length ?? filteredMaterialTotal;
+    return (
+      <>
+        <ErrorNote error={materialPageState.error} />
+        {displayedMaterials.length ? (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {['类别', '资料', '关联', '业务日期', '来源', '状态', '操作'].map((label) => (
+                  <TableHead key={label}>{label}</TableHead>
+                ))}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {displayedMaterials.map((document) => {
+                const relatedNames = relationMode && materialPerspective === "product"
+                  ? document.investors?.map((investor) => investor.display_name).join("、")
+                  : document.products?.map((product) => product.name).join("、") ||
+                    materialProductIds(document).map((id) => productNames.get(id)).filter(Boolean).join("、");
+                return (
+                  <TableRow key={document.id}>
+                    <TableCell>
+                      <span className={`material-category ${materialCategoryOf(document) === "pending" ? "pending" : ""}`}>
+                        {materialCategoryLabel(materialCategoryOf(document))}
+                      </span>
+                      {document.sensitivity === "investor_sensitive" && <small className="sensitive-mark">敏感资料</small>}
+                    </TableCell>
+                    <TableCell>
+                      <div className="file-identity compact-file-identity">
+                        <FileText size={17} />
+                        <div>
+                          <strong>{document.title || document.metadata_json.subject || document.filename}</strong>
+                          <small className="block-sub">{document.filename} · {(document.size / 1024).toFixed(1)} KB</small>
+                        </div>
+                      </div>
+                      {(!document.category || document.category === "nav_valuation") && document.job?.result.errors?.slice(0, 1).map((error, index) => (
+                        <small key={index} className="parse-error">{error.reason}</small>
+                      ))}
+                    </TableCell>
+                    <TableCell>
+                      {relatedNames || (relationMode && materialPerspective === "product" ? "待关联投资者" : "待关联产品")}
+                      {!relationMode && document.investors?.length ? (
+                        <small className="block-sub">投资者：{document.investors.map((investor) => investor.display_name).join("、")}</small>
+                      ) : null}
+                    </TableCell>
+                    <TableCell>
+                      {document.business_date || (document.period_start ? `${document.period_start} 至 ${document.period_end || "待补充"}` : "待补充")}
+                    </TableCell>
+                    <TableCell>
+                      {sourceLabel(document.source)}
+                      {document.parent_id && <small className="block-sub">邮件附件</small>}
+                      <small className="block-sub">{timestamp(document.received_at)}</small>
+                    </TableCell>
+                    <TableCell>
+                      <Status
+                        state={document.material_status === "organized" ? "completed" : document.job?.status || "open"}
+                        text={document.material_status === "organized" ? "已整理" : document.job ? undefined : "待整理"}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <div className="row-actions material-row-actions">
+                        {perm?.write && (
+                          <Button variant="outline" onClick={() => setModal({ kind: "material", document })}>整理</Button>
+                        )}
+                        {perm?.download && (
+                          <a className="icon-link" aria-label={`下载 ${document.filename}`} href={`/api/documents/${document.id}/download`}>
+                            <Download size={15} />
+                          </a>
+                        )}
+                        {perm?.write && document.job && (!document.category || document.category === "nav_valuation") &&
+                          !["queued", "processing"].includes(document.job.status) && (
+                            <Button variant="ghost" onClick={() => void action(() => post(`/documents/${document.id}/reparse`))}>重新解析</Button>
+                          )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        ) : (
+          <Empty
+            title={materialPageState.loading ? "正在读取资料…" : materialCounts.all ? "当前范围内没有资料" : "还没有归档资料"}
+            text={materialCounts.all ? "调整关系或筛选条件后再查看。" : "上传业务资料，或由只读邮箱接收附件后开始整理。"}
+          >
+            {perm?.write && <Button variant="outline" onClick={() => setModal({ kind: "upload" })}><Upload />上传第一份材料</Button>}
+          </Empty>
+        )}
+        <div className="table-footer material-pagination">
+          <span>{documentsOverride ? `共 ${displayedTotal} 条` : filteredMaterialTotal ? `第 ${materialPage * materialPageSize + 1}–${Math.min((materialPage + 1) * materialPageSize, filteredMaterialTotal)} 条，共 ${filteredMaterialTotal} 条` : "当前没有符合条件的资料"}</span>
+          {!documentsOverride && (
+          <div className="row-actions">
+            <Button variant="outline" disabled={materialPage === 0 || materialPageState.loading} onClick={() => setMaterialPage((page) => Math.max(0, page - 1))}>上一页</Button>
+            <Button variant="outline" disabled={(materialPage + 1) * materialPageSize >= filteredMaterialTotal || materialPageState.loading} onClick={() => setMaterialPage((page) => page + 1)}>下一页</Button>
+          </div>
+          )}
+        </div>
+      </>
+    );
+  }
   const shares = products.flatMap((product) => product.shares.map((s) => ({ ...s, product })));
   const allSeries = history?.series || [];
   const cutoff =
@@ -453,7 +1049,22 @@ function Workspace({
               key={n.id}
               className={"nav-link " + (view === n.id ? "active" : "")}
               aria-label={n.label}
-              onClick={() => go(n.id)}
+              onClick={() => {
+                if (n.id === "upload") {
+                  setMaterialSection(perm?.investor_read ? "relations" : "documents");
+                  setMaterialPerspective("product");
+                  setMaterialEntitySearch("");
+                  setMaterialOnlyAttention(false);
+                  setMaterialProduct("");
+                  setMaterialInvestor("");
+                  setMaterialCategory("");
+                  setMaterialSource("");
+                  setMaterialSensitivity("");
+                  setMaterialFilter("all");
+                  setMaterialPage(0);
+                }
+                go(n.id);
+              }}
               aria-current={view === n.id ? "page" : undefined}
             >
               <n.icon size={17} />
@@ -607,12 +1218,13 @@ function Workspace({
                       核对估值日{" "}
                       <input
                         type="date"
-                        value={checkDate}
+                        value={effectiveCheckDate}
                         onChange={(e) => {
                           if (e.target.value) setCheckDate(e.target.value);
                         }}
                       />
                     </label>
+                    <ErrorNote error={summaryState.error || receiptState.error || receiptState.data?.calendar_error || undefined} />
                     <div className="progress-track">
                       <div
                         style={{
@@ -623,7 +1235,7 @@ function Workspace({
                     <small>
                       指定估值日：应收 {summaryState.data?.expected ?? 0} 类份额 · 已收到{" "}
                       {summaryState.data?.received ?? 0} · 已有效确认{" "}
-                      {summaryState.data?.confirmed ?? 0}。周频与节假日请按材料核实日期。
+                      {summaryState.data?.confirmed ?? 0}。按交易日历和日／周频规则统计；收到材料不代表净值已确认。
                     </small>
                   </section>
                   <div className="live-overview-grid">
@@ -706,7 +1318,9 @@ function Workspace({
                         </Empty>
                       )}
                     </section>
-                    <section className="panel">
+                    <div className="overview-side">
+                      <OperationCalendar managerId={managerId} revision={revision} />
+                      <section className="panel">
                       <div className="panel-head">
                         <div>
                           <h2>需要你关注</h2>
@@ -741,7 +1355,8 @@ function Workspace({
                           text="收到材料后，异常与未确认内容会汇集在这里。"
                         />
                       )}
-                    </section>
+                      </section>
+                    </div>
                   </div>
                   <div className="callout">
                     <ShieldCheck size={19} />
@@ -948,7 +1563,7 @@ function Workspace({
                                       ? "周频"
                                       : "日频"}
                                 </TableCell>
-                                <TableCell>{p.cutoff}</TableCell>
+                                <TableCell>{p.frequency === "daily" ? "15:00" : p.cutoff}</TableCell>
                                 <TableCell>
                                   {p.strategy || "未填写"}
                                   <small className="block-sub">{p.currency}</small>
@@ -965,6 +1580,29 @@ function Workspace({
                                     >
                                       查看
                                     </Button>
+                                    {perm?.archive && (
+                                      <Button
+                                        variant="ghost"
+                                        onClick={() => {
+                                          setMaterialProduct(p.id);
+                                          setMaterialInvestor("");
+                                          setMaterialPerspective("product");
+                                          setMaterialSection(perm?.investor_read ? "relations" : "documents");
+                                          setMaterialPage(0);
+                                          go("upload");
+                                        }}
+                                      >
+                                        资料
+                                      </Button>
+                                    )}
+                                    {perm?.write && (
+                                      <Button
+                                        variant="ghost"
+                                        onClick={() => setModal({ kind: "upload", productId: p.id })}
+                                      >
+                                        上传资料
+                                      </Button>
+                                    )}
                                     {perm?.write && (
                                       <Button
                                         variant="ghost"
@@ -1293,175 +1931,474 @@ function Workspace({
                 <>
                   <PageTitle
                     eyebrow={view === "mail" ? "THE ORIGINAL, ALWAYS" : "FROM MATERIAL TO DATA"}
-                    title={view === "mail" ? "邮件归档" : "上传与解析"}
+                    title={view === "mail" ? "邮件中心" : "资料中心"}
                     text={
                       view === "mail"
-                        ? "原始邮件不删除，附件与业务记录相互关联。"
-                        : "上传后先保留原件，再由后台解析与规则校验。"
+                        ? "按接收邮箱查看全部已归档邮件，点击列表直接阅读正文和附件。"
+                        : "从产品或投资者出发，查看双方关系及其共同资料；原件、整理结果和处理记录始终可以追溯。"
                     }
                   >
-                    {perm?.write && (
+                    {view === "mail" && perm?.write && (
                       <Button onClick={() => setModal({ kind: "upload" })}>
                         <Upload />
-                        上传附件
+                        上传资料
+                      </Button>
+                    )}
+                    {view === "upload" && perm?.write && (
+                      <Button onClick={() => setModal({ kind: "upload" })}>
+                        <Upload />
+                        上传资料
+                      </Button>
+                    )}
+                    {view === "upload" && perm?.investor_write && (
+                      <Button variant="outline" onClick={() => setModal({ kind: "investor" })}>
+                        <Plus />
+                        建立投资者
                       </Button>
                     )}
                   </PageTitle>
                   <ErrorNote error={docsState.error} />
-                  {view === "mail" && (
-                    <div className="mailbox-summary">
-                      {boxes.length ? (
-                        boxes.map((b) => (
-                          <section className="panel" key={b.id}>
-                            <Mail size={19} />
-                            <h2>{b.label}</h2>
-                            <Status
-                              state={b.error ? "review" : b.enabled ? "completed" : "open"}
-                              text={b.error ? "连接异常" : b.enabled ? "已启用" : "待配置启用"}
-                            />
-                            <p>上次同步：{timestamp(b.last_sync)}</p>
-                            {b.error && <ErrorNote error={b.error} />}
-                          </section>
-                        ))
-                      ) : (
-                        <div className="callout compact-callout">
-                          <Mail size={19} />
-                          <span>
-                            尚未接入邮箱。管理员可在“组织与权限”中填写配置并测试启用。
-                          </span>
+                  {view === "mail" && base && (
+                    <MailWorkspace key={managerId} base={base} boxes={boxes} boxesError={boxesState.error}
+                      revision={revision} canWrite={Boolean(perm?.write)}
+                      renderDetail={(item) => <MailDetailView key={item.id} item={item} canDownload={Boolean(perm?.download)} />}
+                      onAction={(item) => setModal({ kind: "mail-action", item })}
+                      onClassify={(item) => setModal({ kind: "mail-classify", item })} />
+                  )}
+                  {view === "upload" && (
+                    <>
+                      <div className="view-tabs material-primary-tabs" aria-label="资料中心视图">
+                        {perm?.investor_read && (
+                          <button
+                            className={effectiveMaterialSection === "relations" ? "current" : ""}
+                            onClick={() => {
+                              setMaterialSection("relations");
+                              setMaterialFilter("all");
+                              resetMaterialFilters();
+                            }}
+                          >
+                            关系工作台
+                          </button>
+                        )}
+                        <button
+                          className={effectiveMaterialSection === "documents" ? "current" : ""}
+                          onClick={() => {
+                            setMaterialSection("documents");
+                            setMaterialFilter("all");
+                            setMaterialProduct("");
+                            setMaterialInvestor("");
+                            resetMaterialFilters();
+                          }}
+                        >
+                          全部资料
+                        </button>
+                        <button
+                          className={effectiveMaterialSection === "pending" ? "current" : ""}
+                          onClick={() => {
+                            setMaterialSection("pending");
+                            setMaterialFilter("pending");
+                            setMaterialProduct("");
+                            setMaterialInvestor("");
+                            resetMaterialFilters();
+                          }}
+                        >
+                          待整理 <small>{materialCounts.pending}</small>
+                        </button>
+                      </div>
+
+                      {effectiveMaterialSection === "relations" && (
+                        <section className="material-workbench panel">
+                          <div className="material-workbench-toolbar">
+                            <div className="material-direction" aria-label="关系查看方向">
+                              <button
+                                className={materialPerspective === "product" ? "current" : ""}
+                                onClick={() => {
+                                  setMaterialPerspective("product");
+                                  setMaterialProduct(materialProduct || selectedRelatedProduct?.id || products[0]?.id || "");
+                                  setMaterialInvestor("");
+                                  setMaterialPage(0);
+                                }}
+                              >
+                                按产品
+                              </button>
+                              <button
+                                className={materialPerspective === "investor" ? "current" : ""}
+                                onClick={() => {
+                                  setMaterialPerspective("investor");
+                                  setInvestorDetailTab("basic");
+                                  setMaterialInvestor(materialInvestor || selectedRelatedInvestor?.id || investors[0]?.id || "");
+                                  setMaterialProduct("");
+                                  setMaterialPage(0);
+                                }}
+                              >
+                                按投资者
+                              </button>
+                            </div>
+                            <div className="search-inline material-entity-search">
+                              <Search size={15} />
+                              <Input
+                                aria-label={materialPerspective === "product" ? "搜索产品" : "搜索投资者"}
+                                placeholder={materialPerspective === "product" ? "搜索产品名称或代码" : "搜索投资者名称或类型"}
+                                value={materialEntitySearch}
+                                onChange={(event) => setMaterialEntitySearch(event.target.value)}
+                              />
+                            </div>
+                            <Button
+                              variant={materialOnlyAttention ? "outline" : "ghost"}
+                              aria-pressed={materialOnlyAttention}
+                              onClick={() => setMaterialOnlyAttention((value) => !value)}
+                            >
+                              {materialOnlyAttention ? "已筛选有待办" : "仅看有待办"}
+                            </Button>
+                          </div>
+
+                          <div className="material-workbench-grid">
+                            <aside className="material-entity-panel">
+                              <div className="material-entity-heading">
+                                <strong>{materialPerspective === "product" ? "产品" : "投资者"}</strong>
+                                <span>{materialPerspective === "product" ? searchedProductEntities.length : searchedInvestorEntities.length} 个主体</span>
+                              </div>
+                              <div className="material-entity-list">
+                                {materialPerspective === "product" ? searchedProductEntities.map((product) => (
+                                  <button
+                                    key={product.id}
+                                    className={selectedWorkbenchProduct?.id === product.id ? "current" : ""}
+                                    onClick={() => {
+                                      setMaterialProduct(product.id);
+                                      setMaterialInvestor("");
+                                      setMaterialPage(0);
+                                    }}
+                                  >
+                                    <span className="material-entity-name"><i />{product.name}</span>
+                                    <small>{product.code}</small>
+                                    <span className="material-entity-counts">
+                                      <small>{product.relationCount} 个关联</small>
+                                      <small>{product.materialCount} 份资料</small>
+                                      <small className={product.attentionCount ? "attention" : ""}>{product.attentionCount} 待核对</small>
+                                    </span>
+                                  </button>
+                                )) : searchedInvestorEntities.map((investor) => (
+                                  <button
+                                    key={investor.id}
+                                    className={selectedWorkbenchInvestor?.id === investor.id ? "current" : ""}
+                                    onClick={() => {
+                                      setMaterialInvestor(investor.id);
+                                      setInvestorDetailTab("basic");
+                                      setMaterialProduct("");
+                                      setMaterialPage(0);
+                                    }}
+                                  >
+                                    <span className="material-entity-name"><i />{investor.display_name}</span>
+                                    <small>{investorTypeLabels[investor.investor_type]} · {investorStatusLabels[investor.status]}</small>
+                                    <span className="material-entity-counts">
+                                      <small>{investor.relationCount} 个关联</small>
+                                      <small>{investor.materialCount} 份资料</small>
+                                      <small className={investor.attentionCount ? "attention" : ""}>{investor.attentionCount} 待核对</small>
+                                    </span>
+                                  </button>
+                                ))}
+                                {!searchedProductEntities.length && materialPerspective === "product" && (
+                                  <p className="material-list-empty">没有符合条件的产品。</p>
+                                )}
+                                {!searchedInvestorEntities.length && materialPerspective === "investor" && (
+                                  <p className="material-list-empty">没有符合条件的投资者。</p>
+                                )}
+                              </div>
+                            </aside>
+
+                            <div className="material-relation-content">
+                              {(materialPerspective === "product" ? selectedWorkbenchProduct : selectedWorkbenchInvestor) ? (
+                                <>
+                                  <header className="material-subject">
+                                    <div>
+                                      <span>当前{materialPerspective === "product" ? "产品" : "投资者"}</span>
+                                      <h2>{materialPerspective === "product" ? selectedWorkbenchProduct?.name : selectedWorkbenchInvestor?.display_name}</h2>
+                                      <p>
+                                        {materialPerspective === "product"
+                                          ? `${selectedWorkbenchProduct?.code || "产品代码待补"} · 关系与资料仅作运营归档和核对`
+                                          : `${investorTypeLabels[selectedWorkbenchInvestor?.investor_type || "other"]} · ${investorStatusLabels[selectedWorkbenchInvestor?.status || "pending"]} · ${investorSourceLabels[selectedWorkbenchInvestor?.source || "manual"]}`}
+                                      </p>
+                                    </div>
+                                    <div className="material-subject-side">
+                                      {perm?.write && materialPerspective === "product" && selectedWorkbenchProduct && (
+                                        <Button onClick={() => setModal({ kind: "upload", productId: selectedWorkbenchProduct.id })}>
+                                          <Upload size={14} />
+                                          上传到该产品
+                                        </Button>
+                                      )}
+                                      {perm?.write && materialPerspective === "investor" && selectedWorkbenchInvestor && (
+                                        <Button onClick={() => setModal({ kind: "upload", investorId: selectedWorkbenchInvestor.id })}>
+                                          <Upload size={14} />
+                                          上传到该投资者
+                                        </Button>
+                                      )}
+                                      {materialPerspective === "investor" && selectedWorkbenchInvestor && perm?.investor_write && (
+                                        <Button variant="outline" onClick={() => setModal({ kind: "investor", investor: selectedWorkbenchInvestor })}>编辑投资者</Button>
+                                      )}
+                                      <div className="material-subject-stats">
+                                        <div><span>关联{materialPerspective === "product" ? "投资者" : "产品"}</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.relationCount : selectedWorkbenchInvestor?.relationCount}</strong></div>
+                                        <div><span>资料</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.materialCount : selectedWorkbenchInvestor?.materialCount}</strong></div>
+                                        <div className="attention"><span>待核对</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.attentionCount : selectedWorkbenchInvestor?.attentionCount}</strong></div>
+                                      </div>
+                                    </div>
+                                  </header>
+
+                                  {materialPerspective === "investor" && (
+                                    <nav className="investor-detail-tabs" aria-label="投资者资料分区">
+                                      {([
+                                        ["basic", "基本信息"],
+                                        ["suitability", "适当性"],
+                                        ["accounts", "银行账户"],
+                                        ["general", "通用资料"],
+                                        ["business", "产品业务资料"],
+                                      ] as [InvestorDetailTab, string][]).map(([tab, label]) => (
+                                        <button
+                                          key={tab}
+                                          className={investorDetailTab === tab ? "current" : ""}
+                                          onClick={() => {
+                                            setInvestorDetailTab(tab);
+                                            if (tab !== "business") setMaterialProduct("");
+                                            setMaterialPage(0);
+                                          }}
+                                        >
+                                          {label}
+                                        </button>
+                                      ))}
+                                    </nav>
+                                  )}
+
+                                  {(materialPerspective === "product" || investorDetailTab === "business") && (
+                                  <section className="material-relations">
+                                    <div className="material-section-heading">
+                                      <strong>关联{materialPerspective === "product" ? "投资者" : "产品"}</strong>
+                                      <span>选择后只看双方共同资料</span>
+                                    </div>
+                                    <div className="material-relation-list">
+                                      {materialPerspective === "product" ? relatedWorkbenchInvestors.map((investor) => (
+                                        <button
+                                          key={investor.id}
+                                          className={materialInvestor === investor.id ? "current" : ""}
+                                          onClick={() => {
+                                            setMaterialInvestor(materialInvestor === investor.id ? "" : investor.id);
+                                            setMaterialPage(0);
+                                          }}
+                                        >
+                                          <strong>{investor.display_name}</strong>
+                                          <small>{investorTypeLabels[investor.investor_type]} · {investorStatusLabels[investor.status]}</small>
+                                          <span><small>{investor.commonMaterialCount} 份资料</small><small className={investor.commonAttentionCount ? "attention" : ""}>{investor.commonAttentionCount ? `待核对 ${investor.commonAttentionCount}` : "已核对"}</small></span>
+                                        </button>
+                                      )) : relatedWorkbenchProducts.map((product) => (
+                                        <button
+                                          key={product.id}
+                                          className={materialProduct === product.id ? "current" : ""}
+                                          onClick={() => {
+                                            setMaterialProduct(materialProduct === product.id ? "" : product.id);
+                                            setMaterialPage(0);
+                                          }}
+                                        >
+                                          <strong>{product.name}</strong>
+                                          <small>{product.code}</small>
+                                          <span><small>{product.commonMaterialCount} 份资料</small><small className={product.commonAttentionCount ? "attention" : ""}>{product.commonAttentionCount ? `待核对 ${product.commonAttentionCount}` : "已核对"}</small></span>
+                                        </button>
+                                      ))}
+                                      {materialPerspective === "product" && !relatedWorkbenchInvestors.length && <p className="material-list-empty">该产品尚未关联投资者。</p>}
+                                      {materialPerspective === "investor" && !relatedWorkbenchProducts.length && <p className="material-list-empty">该投资者尚未关联产品。</p>}
+                                    </div>
+                                  </section>
+                                  )}
+
+                                  {materialPerspective === "investor" && investorDetailTab === "basic" && selectedWorkbenchInvestor && (
+                                    <section className="investor-profile-section">
+                                      <div className="investor-profile-heading">
+                                        <div>
+                                          <strong>投资者基础信息</strong>
+                                          <span>主体身份与适当性分类分别记录</span>
+                                        </div>
+                                        <Status state={selectedWorkbenchInvestor.status} text={investorStatusLabels[selectedWorkbenchInvestor.status]} />
+                                      </div>
+                                      <dl className="investor-field-grid">
+                                        <div><dt>主体类型</dt><dd>{investorTypeLabels[selectedWorkbenchInvestor.investor_type]}</dd></div>
+                                        <div><dt>适当性类型</dt><dd>{suitabilityClassLabels[selectedWorkbenchInvestor.suitability_class || "unknown"]}</dd></div>
+                                        <div><dt>证件类型</dt><dd>{selectedWorkbenchInvestor.certificate_type || "待补充"}</dd></div>
+                                        <div><dt>证件号码</dt><dd>{selectedWorkbenchInvestor.certificate_number_masked || "待补充"}</dd></div>
+                                        <div><dt>证件有效期</dt><dd>{selectedWorkbenchInvestor.certificate_valid_until || "待补充"}</dd></div>
+                                        <div><dt>国籍／注册地</dt><dd>{selectedWorkbenchInvestor.nationality_or_region || "待补充"}</dd></div>
+                                        <div><dt>联系邮箱</dt><dd>{selectedWorkbenchInvestor.contact_email || "待补充"}</dd></div>
+                                        <div><dt>联系电话</dt><dd>{selectedWorkbenchInvestor.contact_phone || "待补充"}</dd></div>
+                                      </dl>
+                                      {selectedWorkbenchInvestor.notes && (
+                                        <div className="investor-profile-note">
+                                          <span>档案备注</span>
+                                          <p>{selectedWorkbenchInvestor.notes}</p>
+                                        </div>
+                                      )}
+                                      <div className="investor-related-products">
+                                        <div className="material-section-heading">
+                                          <strong>关联产品</strong>
+                                          <span>{relatedWorkbenchProducts.length} 只</span>
+                                        </div>
+                                        <div className="investor-product-chips">
+                                          {relatedWorkbenchProducts.map((product) => (
+                                            <button
+                                              key={product.id}
+                                              onClick={() => {
+                                                setInvestorDetailTab("business");
+                                                setMaterialProduct(product.id);
+                                                setMaterialPage(0);
+                                              }}
+                                            >
+                                              <strong>{product.name}</strong>
+                                              <small>{product.code}</small>
+                                            </button>
+                                          ))}
+                                          {!relatedWorkbenchProducts.length && <span className="material-list-empty">尚未关联产品</span>}
+                                        </div>
+                                      </div>
+                                    </section>
+                                  )}
+
+                                  {materialPerspective === "investor" && investorDetailTab === "suitability" && selectedWorkbenchInvestor && (
+                                    <section className="investor-profile-section">
+                                      <div className="investor-profile-heading">
+                                        <div>
+                                          <strong>适当性信息</strong>
+                                          <span>当前字段与归档原件分开呈现</span>
+                                        </div>
+                                      </div>
+                                      <dl className="investor-field-grid compact">
+                                        <div><dt>投资者分类</dt><dd>{suitabilityClassLabels[selectedWorkbenchInvestor.suitability_class || "unknown"]}</dd></div>
+                                        <div><dt>专业投资者类型</dt><dd>{selectedWorkbenchInvestor.professional_investor_type || "不适用／待补充"}</dd></div>
+                                        <div><dt>风险等级</dt><dd>{selectedWorkbenchInvestor.risk_level || "待补充"}</dd></div>
+                                        <div><dt>测评日期</dt><dd>{selectedWorkbenchInvestor.risk_assessed_at || "待补充"}</dd></div>
+                                        <div><dt>测评到期日</dt><dd>{selectedWorkbenchInvestor.risk_expires_at || "待补充"}</dd></div>
+                                        <div><dt>特定对象确认</dt><dd>{specificObjectStatusLabels[selectedWorkbenchInvestor.specific_object_status || "unknown"]}</dd></div>
+                                        <div><dt>合格材料状态</dt><dd>{qualifiedMaterialStatusLabels[selectedWorkbenchInvestor.qualified_material_status || "unknown"]}</dd></div>
+                                        <div><dt>材料有效期间</dt><dd>{selectedWorkbenchInvestor.qualified_material_from || "待补充"} 至 {selectedWorkbenchInvestor.qualified_material_until || "待补充"}</dd></div>
+                                      </dl>
+                                      <div className="investor-checklist">
+                                        <div className="material-section-heading">
+                                          <strong>适当性资料</strong>
+                                          <span>清单随主体类型和普通／专业分类变化；优先使用资料细类，旧资料兼容文件名归纳</span>
+                                        </div>
+                                        <div className="investor-checklist-grid">
+                                          {selectedInvestorChecklist.map((item) => (
+                                            <div key={item.key} className={item.documents.length ? "present" : ""}>
+                                              <i>{item.documents.length ? "✓" : "—"}</i>
+                                              <span><strong>{item.label}</strong><small>{item.documents.length ? "已归档 " + item.documents.length + " 份" : "待补充"}</small></span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    </section>
+                                  )}
+
+                                  {materialPerspective === "investor" && investorDetailTab === "accounts" && selectedWorkbenchInvestor && (
+                                    <section className="investor-profile-section">
+                                      <div className="investor-profile-heading">
+                                        <div>
+                                          <strong>银行账户</strong>
+                                          <span>一个投资者可以登记多个账户，并可指定关联产品</span>
+                                        </div>
+                                        {perm?.investor_write && (
+                                          <Button variant="outline" onClick={() => setModal({ kind: "bank-account", investor: selectedWorkbenchInvestor })}>
+                                            <Plus size={14} />新增账户
+                                          </Button>
+                                        )}
+                                      </div>
+                                      {selectedWorkbenchInvestor.bank_accounts?.length ? (
+                                        <div className="investor-account-list">
+                                          {selectedWorkbenchInvestor.bank_accounts.map((account) => (
+                                            <div key={account.id}>
+                                              <span><strong>{account.account_name}</strong><small>{account.status === "active" ? "有效" : "已停用"}</small></span>
+                                              <p>{account.account_number_masked}</p>
+                                              <small>{account.bank_name} · {account.branch_name || "开户行待补充"} · {account.currency}</small>
+                                              {perm?.investor_write && <Button variant="ghost" onClick={() => setModal({ kind: "bank-account", investor: selectedWorkbenchInvestor, account })}>编辑账户</Button>}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <Empty title="暂无银行账户信息" text="账户字段将在录入后脱敏显示；账户证明原件继续归档在投资者资料中。">
+                                          {perm?.investor_write && <Button variant="outline" onClick={() => setModal({ kind: "bank-account", investor: selectedWorkbenchInvestor })}><Plus size={14} />新增账户</Button>}
+                                        </Empty>
+                                      )}
+                                    </section>
+                                  )}
+
+                                  {(materialPerspective === "product" || investorDetailTab === "general" || (investorDetailTab === "business" && selectedRelatedProduct)) && (
+                                  <>
+                                  <div className="material-scope">
+                                    <span>当前范围</span>
+                                    <strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.name : selectedWorkbenchInvestor?.display_name}</strong>
+                                    {(selectedRelatedInvestor || selectedRelatedProduct) && <ArrowRight size={13} />}
+                                    {(selectedRelatedInvestor || selectedRelatedProduct) && <strong>{selectedRelatedInvestor?.display_name || selectedRelatedProduct?.name}</strong>}
+                                    <b>
+                                      {materialPerspective === "investor"
+                                        ? investorDetailTab === "general"
+                                          ? "通用资料 " + selectedInvestorGeneralDocuments.length
+                                          : "产品业务资料 " + selectedInvestorBusinessDocuments.length
+                                        : selectedRelatedInvestor
+                                          ? "共同资料 " + filteredMaterialTotal
+                                          : "全部资料 " + filteredMaterialTotal}
+                                    </b>
+                                    {(selectedRelatedInvestor || selectedRelatedProduct) && (
+                                      <button onClick={() => {
+                                        if (materialPerspective === "product") setMaterialInvestor("");
+                                        else setMaterialProduct("");
+                                        setMaterialPage(0);
+                                      }}>清除关联 <X size={12} /></button>
+                                    )}
+                                  </div>
+                                  {materialPerspective === "product" && renderMaterialFilters(false)}
+                                  <div className="material-table-wrap">
+                                    {renderMaterialTable(
+                                      true,
+                                      materialPerspective === "investor"
+                                        ? investorDetailTab === "general"
+                                          ? selectedInvestorGeneralDocuments
+                                          : selectedInvestorBusinessDocuments
+                                        : undefined,
+                                    )}
+                                  </div>
+                                  </>
+                                  )}
+                                  {materialPerspective === "investor" && investorDetailTab === "business" && !selectedRelatedProduct && (
+                                    <Empty title="请选择关联产品" text="选择上方产品后查看该投资者与产品之间的合同、认申购、赎回和其他共同资料。" />
+                                  )}
+                                </>
+                              ) : (
+                                <Empty
+                                  title={materialPerspective === "product" ? "尚未建立产品" : "尚未建立投资者"}
+                                  text={materialPerspective === "product" ? "先在产品台账建立产品后再关联资料。" : "建立投资者后即可查看其产品和共同资料。"}
+                                >
+                                  {materialPerspective === "investor" && perm?.investor_write && <Button variant="outline" onClick={() => setModal({ kind: "investor" })}><Plus />建立投资者</Button>}
+                                </Empty>
+                              )}
+                            </div>
+                          </div>
+                        </section>
+                      )}
+
+                      {(effectiveMaterialSection === "documents" || effectiveMaterialSection === "pending") && (
+                        <section className="panel material-center-panel material-flat-panel">
+                          <div className="list-tools material-list-heading">
+                            <div>
+                              <h2>{effectiveMaterialSection === "pending" ? "待整理资料" : "全部资料"}</h2>
+                              <p>{effectiveMaterialSection === "pending" ? "补充类别、主体和业务日期后形成可查询的资料关系。" : "按主体、类别、来源和敏感级别查询归档资料。"}</p>
+                            </div>
+                            {renderMaterialFilters(true)}
+                          </div>
+                          {renderMaterialTable(false)}
+                        </section>
+                      )}
+
+                      {effectiveMaterialSection === "relations" && (
+                        <div className="callout material-permission-note">
+                          <ShieldCheck size={18} />
+                          <p>投资者及其关联资料只向本牌照有权限的运营、管理员及合规角色开放；关系工作台不计算持有份额，也不代替托管平台执行申购或赎回。</p>
                         </div>
                       )}
-                    </div>
+                    </>
                   )}
-                  <section className="panel">
-                    <div className="list-tools">
-                      <div className="search-inline">
-                        <Search size={15} />
-                        <Input
-                          aria-label="搜索归档文件"
-                          placeholder="搜索文件名称、邮件主题"
-                          value={search}
-                          onChange={(e) => setSearch(e.target.value)}
-                        />
-                      </div>
-                      <span className="muted">最近 300 份材料</span>
-                    </div>
-                    {docs.length ? (
-                      <Table>
-                        <TableHeader>
-                          <TableRow>
-                            {["材料 / 邮件", "来源", "收到时间", "解析状态", "操作"].map((s) => (
-                              <TableHead key={s}>{s}</TableHead>
-                            ))}
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {docs
-                            .filter(
-                              (d) =>
-                                (view !== "mail" || d.source === "email") &&
-                                (d.filename + (d.metadata_json.subject || "")).includes(search),
-                            )
-                            .map((d) => (
-                              <TableRow key={d.id}>
-                                <TableCell>
-                                  <div className="file-identity">
-                                    <FileText size={19} />
-                                    <div>
-                                      <strong>{d.metadata_json.subject || d.filename}</strong>
-                                      <small className="block-sub">
-                                        {d.metadata_json.from || d.filename} ·{" "}
-                                        {(d.size / 1024).toFixed(1)} KB
-                                      </small>
-                                      <small className="hash" title={d.sha256}>
-                                        SHA-256 {d.sha256.slice(0, 16)}…
-                                      </small>
-                                    </div>
-                                  </div>
-                                  {d.job?.result.errors?.slice(0, 2).map((e, i) => (
-                                    <small key={i} className="parse-error">
-                                      {e.reason}
-                                    </small>
-                                  ))}
-                                </TableCell>
-                                <TableCell>
-                                  {sourceLabel(d.source)}
-                                  {d.parent_id && <small className="block-sub">邮件附件</small>}
-                                </TableCell>
-                                <TableCell>{timestamp(d.received_at)}</TableCell>
-                                <TableCell>
-                                  <Status
-                                    state={d.job?.status || "completed"}
-                                    text={d.job ? undefined : "原件已归档"}
-                                  />
-                                  {d.job?.status === "queued" && (
-                                    <small className="block-sub">等待后台任务</small>
-                                  )}
-                                </TableCell>
-                                <TableCell>
-                                  <div className="row-actions">
-                                    {perm?.download && (
-                                      <a
-                                        className="icon-link"
-                                        aria-label={`下载 ${d.filename}`}
-                                        href={`/api/documents/${d.id}/download`}
-                                      >
-                                        <Download size={15} />
-                                      </a>
-                                    )}
-                                    {perm?.write &&
-                                      d.job &&
-                                      !["queued", "processing"].includes(d.job.status) && (
-                                        <Button
-                                          variant="ghost"
-                                          onClick={() =>
-                                            void action(() => post(`/documents/${d.id}/reparse`))
-                                          }
-                                        >
-                                          重新解析
-                                        </Button>
-                                      )}
-                                    {perm?.write &&
-                                      d.job?.result.errors?.find((e) => e.candidate) && (
-                                        <Button
-                                          variant="outline"
-                                          onClick={() =>
-                                            setModal({
-                                              kind: "product",
-                                              candidate: d.job!.result.errors!.find(
-                                                (e) => e.candidate,
-                                              )!.candidate,
-                                              documentId: d.id,
-                                            })
-                                          }
-                                        >
-                                          确认候选产品
-                                        </Button>
-                                      )}
-                                  </div>
-                                </TableCell>
-                              </TableRow>
-                            ))}
-                        </TableBody>
-                      </Table>
-                    ) : (
-                      <Empty
-                        title={docsState.loading ? "正在读取归档…" : "还没有归档材料"}
-                        text="上传托管附件开始试运行；邮箱需由管理员配置后才能收件。"
-                      >
-                        {perm?.write && (
-                          <Button variant="outline" onClick={() => setModal({ kind: "upload" })}>
-                            <Upload />
-                            上传第一份材料
-                          </Button>
-                        )}
-                      </Empty>
-                    )}
-                    <div className="table-footer">
-                      <span>原件仅追加 · 不提供删除或替换入口</span>
-                      <span>查看与下载分别授权</span>
-                    </div>
-                  </section>
                 </>
               )}
               {view === "exceptions" && (
@@ -1478,6 +2415,8 @@ function Workspace({
                     )}
                   </PageTitle>
                   <ErrorNote error={tasksState.error} />
+                  <ErrorNote error={receiptState.error || receiptState.data?.error || receiptState.data?.calendar_error || undefined} />
+                  <p className="inline-note">自动应收：{receiptState.data?.enabled ? "已启用" : "未启用，请在组织与权限配置"}。15:00 截止；下一交易日 {receiptState.data?.followup_time || "09:00"} 仍缺件时提示核查。最近检查：{receiptState.data?.last_checked_at ? timestamp(receiptState.data.last_checked_at) : "尚未执行"}。</p>
                   <div className="toolbar">
                     <div className="view-tabs">
                       <button
@@ -1519,7 +2458,7 @@ function Workspace({
                             .map((t) => (
                               <TableRow key={t.id}>
                                 <TableCell>
-                                  <strong>{taskLabel(t.kind)}</strong>
+                                  <strong>{t.kind === "missing" ? (t.payload.stage === "followup" ? "持续缺件 · 请核查托管补发" : "净值材料迟到") : taskLabel(t.kind)}</strong>
                                   <small className="block-sub">
                                     {t.payload.errors?.[0]?.reason ||
                                       t.payload.errors?.[0]?.message ||
@@ -1613,6 +2552,8 @@ function Workspace({
                     )}
                   </PageTitle>
                   <ErrorNote error={membersState.error} />
+                  <ErrorNote error={receiptState.error} />
+                  {perm?.admin && receiptState.data && <ReceiptSettings key={managerId + String(receiptState.data.enabled) + receiptState.data.followup_time} managerId={managerId} policy={receiptState.data} done={done} />}
                   <section className="panel">
                     <div className="panel-head">
                       <h2>成员与角色</h2>
@@ -1797,7 +2738,7 @@ function Workspace({
           if (!open) setModal(null);
         }}
       >
-        <DialogContent className="live-dialog">
+        <DialogContent className={`live-dialog ${modal?.kind === "mail-detail" ? "mail-detail-dialog" : ""}`}>
           <DialogHeader>
             <DialogTitle>
               {
@@ -1805,12 +2746,22 @@ function Workspace({
                   product: "产品建档",
                   filing: "新建产品备案",
                   nav: modal?.kind === "nav" && modal.task ? "人工补齐材料" : "人工补录净值",
-                  upload: "上传与解析",
+                  upload: modal?.kind === "upload" && modal.productId
+                    ? "上传到产品"
+                    : modal?.kind === "upload" && modal.investorId
+                      ? "上传到投资者"
+                      : "上传资料",
+                  material: "整理资料",
+                  investor: modal?.kind === "investor" && modal.investor ? "整理投资者" : "建立投资者",
+                  "bank-account": modal?.kind === "bank-account" && modal.account ? "编辑银行账户" : "新增银行账户",
                   schedule: "应收配置",
                   lifecycle: "产品生命周期",
                   member: "成员授权",
                   task: "异常详情",
                   mailbox: modal?.kind === "mailbox" && modal.mailbox ? "编辑邮箱" : "登记邮箱",
+                  "mail-action": "处理邮件待办",
+                  "mail-classify": "确认邮件分类",
+                  "mail-detail": "邮件详情",
                   check: "检查应收材料",
                   share: "新增份额类别",
                   password: "修改登录密码",
@@ -1818,8 +2769,15 @@ function Workspace({
                 }[modal?.kind || "product"]
               }
             </DialogTitle>
-            <DialogDescription>{manager?.name || "账号设置"} · 所有操作均会留痕</DialogDescription>
+            <DialogDescription>
+              {modal?.kind === "mail-detail"
+                ? "完整正文与附件 · HTML 隔离展示并提供纯文本备用"
+                : `${manager?.name || "账号设置"} · 所有操作均会留痕`}
+            </DialogDescription>
           </DialogHeader>
+          {modal?.kind === "mail-detail" && (
+            <MailDetailView key={modal.item.id} item={modal.item} canDownload={Boolean(perm?.download)} />
+          )}
           {modal?.kind === "product" && (
             <ProductForm
               managerId={managerId}
@@ -1832,10 +2790,26 @@ function Workspace({
             <ProductForm managerId={managerId} filing done={done} />
           )}
           {modal?.kind === "nav" && (
-            <NavForm managerId={managerId} products={products} task={modal.task} done={done} />
+            <NavForm managerId={managerId} products={products} task={modal.task} suggestedDate={suggestedDate} done={done} />
           )}
           {modal?.kind === "upload" && (
-            <UploadForm managerId={managerId} products={products} done={done} />
+            <UploadForm
+              managerId={managerId}
+              products={products}
+              investors={investors}
+              initialProductId={modal.productId}
+              initialInvestorId={modal.investorId}
+              done={done}
+            />
+          )}
+          {modal?.kind === "material" && (
+            <MaterialForm document={modal.document} products={products} investors={investors} done={done} />
+          )}
+          {modal?.kind === "investor" && (
+            <InvestorForm managerId={managerId} investor={modal.investor} products={products} documents={docs} done={done} />
+          )}
+          {modal?.kind === "bank-account" && (
+            <InvestorBankAccountForm investor={modal.investor} account={modal.account} products={products} documents={docs} done={done} />
           )}
           {modal?.kind === "schedule" && <ScheduleForm product={modal.product} done={done} />}
           {modal?.kind === "lifecycle" && <LifecycleForm product={modal.product} done={done} />}
@@ -1867,10 +2841,10 @@ function Workspace({
               submit={(f) => post(`${base}/check-missing?valuation_date=${val(f, "date")}`)}
             >
               <Field label="应收材料对应的估值日">
-                <Input name="date" type="date" required defaultValue={previousFriday()} />
+                <Input name="date" type="date" required defaultValue={suggestedDate} />
               </Field>
               <p className="inline-note">
-                仅检查管理员纳入应收且已过接收截止时间的产品。周频日期可手选；节假日日历尚未接入，请核实估值日。
+                按交易日历检查指定估值日，下一交易日为应收日；日频 15:00 截止，当前覆盖 2025–2026 年。历史检查按当前产品配置，请先核对适用范围。
               </p>
             </ActionForm>
           )}
@@ -1927,7 +2901,7 @@ function Workspace({
               </Field>
               <label className="check-line">
                 <input name="all_folders" type="checkbox" defaultChecked={modal.mailbox?.all_folders ?? true} />
-                同步所有可读取文件夹（包括已归档、已发送等；跨文件夹同一原件只归档一次）
+                同步全部业务文件夹（自动排除已发送、草稿、垃圾邮件和已删除）
               </label>
               <label className="check-line">
                 <input name="send_id" type="checkbox" defaultChecked={modal.mailbox?.send_id ?? modal.mailbox?.host?.endsWith("163.com") ?? true} />
@@ -1938,6 +2912,74 @@ function Workspace({
                 保存后启用后台只读同步
               </label>
               <p className="inline-note">保存前会测试连接。系统使用只读 IMAP，不设置已读、不移动或删除邮件；不同邮箱独立同步。</p>
+            </ActionForm>
+          )}
+          {modal?.kind === "mail-action" && modal.item.action && (
+            <ActionForm
+              done={done}
+              label="记录处理完成"
+              submit={(f) =>
+                post(`/mail-actions/${modal.item.action!.id}/complete`, {
+                  revision: modal.item.action!.revision,
+                  reason: val(f, "reason"),
+                })
+              }
+            >
+              <p className="inline-note">
+                <strong>{modal.item.action.suggested_action}</strong>
+                <br />
+                {modal.item.title}
+              </p>
+              <Field label="处理结果" hint="填写实际完成的动作或核查结论，将与邮件原件一同留痕。">
+                <textarea name="reason" required maxLength={2000} rows={5} />
+              </Field>
+              {perm?.download && (
+                <a className="text-link" href={`/api/documents/${modal.item.document_id}/download`}>
+                  先查看邮件原件
+                </a>
+              )}
+            </ActionForm>
+          )}
+          {modal?.kind === "mail-classify" && (
+            <ActionForm
+              done={done}
+              label="保存分类"
+              submit={(f) =>
+                put(`/mail-items/${modal.item.id}/classification`, {
+                  revision: modal.item.revision,
+                  category: val(f, "category"),
+                  handling_mode: val(f, "handling_mode"),
+                  suggested_action: val(f, "suggested_action") || null,
+                })
+              }
+            >
+              <p className="inline-note">{modal.item.title}</p>
+              <Field label="邮件类型">
+                <select name="category" defaultValue="other">
+                  <option value="nav_valuation">净值 / 估值</option>
+                  <option value="futures_settlement">期货结算</option>
+                  <option value="reconciliation_data">对账 / 数据包</option>
+                  <option value="risk_monitoring">风险 / 投监</option>
+                  <option value="contract_seal">合同 / 用印</option>
+                  <option value="investor_redemption">申赎 / 投资者</option>
+                  <option value="security">安全提醒</option>
+                  <option value="action_required">业务待办</option>
+                  <option value="completion_receipt">完成通知</option>
+                  <option value="marketing">营销信息</option>
+                  <option value="other">其他</option>
+                </select>
+              </Field>
+              <Field label="处理方式">
+                <select name="handling_mode" defaultValue="receipt">
+                  <option value="receipt">作为接收记录</option>
+                  <option value="task">生成业务待办</option>
+                  <option value="archive">仅归档</option>
+                </select>
+              </Field>
+              <Field label="待办建议（选择生成待办时填写）">
+                <Input name="suggested_action" maxLength={500} placeholder="例如：核对并回复托管通知" />
+              </Field>
+              <p className="inline-note">选择净值 / 估值后，受支持的附件才会进入净值解析。</p>
             </ActionForm>
           )}
           {modal?.kind === "rules" && (
@@ -1993,6 +3035,7 @@ function Workspace({
               key={modal.task.id + modal.task.revision}
               task={tasks.find((t) => t.id === modal.task.id) || modal.task}
               manager={manager}
+              documents={docs}
               done={done}
               onComplete={(task) => setModal({ kind: "nav", task })}
               onUpload={() => setModal({ kind: "upload" })}
@@ -2010,7 +3053,9 @@ function TaskDetail({
   done,
   onComplete,
   onUpload,
+  documents,
 }: {
+  documents: Doc[];
   task: Task;
   manager: Manager;
   done: () => void;
@@ -2147,8 +3192,20 @@ function TaskDetail({
           {task.kind === "missing" && (
             <>
               <p className="inline-note">
-                收到匹配产品、份额和估值日的数据后自动解决；解析或校验异常另行保留。
+                应收日 {task.payload.due_date || "待核对"}，截止 {task.payload.cutoff || "15:00"}。
+                {task.payload.stage === "followup" ? "已跨交易日仍未收到，请核查并按需在托管平台补发。" : "已超过接收截止时间。"}
+                材料匹配后解除缺件；解析和校验异常继续保留。
               </p>
+              {task.payload.last_resend && <p className="inline-note">最近托管补发：{timestamp(task.payload.last_resend.at)} · {task.payload.last_resend.reason}。仍在等待材料。</p>}
+              {canProcess && <ActionForm label="记录已在托管平台补发" done={done} submit={f => post(`/tasks/${task.id}/custodian-resend`, {revision: task.revision, reason: val(f, "reason")})}>
+                <Field label="补发操作说明"><textarea name="reason" required maxLength={2000} placeholder="记录已完成的托管平台操作或回执信息" /></Field>
+                <p className="inline-note">只记录你已完成的补发操作，不会替你发送邮件，也不会关闭缺件。</p>
+              </ActionForm>}
+              {manager.permissions.archive && <ActionForm label="确认对应净值材料已收到" done={done} disabled={!documents.some(d => !d.filename.toLowerCase().endsWith(".eml"))} submit={f => post(`/tasks/${task.id}/material-received`, {revision: task.revision, document_id: val(f, "document_id"), reason: val(f, "reason")})}>
+                <Field label="已核对的净值附件"><select name="document_id" required defaultValue=""><option value="" disabled>请选择归档附件</option>{documents.filter(d => !d.filename.toLowerCase().endsWith(".eml") && (!d.product_id || d.product_id === task.product_id)).map(d => <option key={d.id} value={d.id}>{d.filename} · {timestamp(d.received_at)}</option>)}</select></Field>
+                <Field label="材料对应关系说明"><textarea name="reason" required maxLength={2000} placeholder="确认材料对应本事项的产品、份额和估值日" /></Field>
+                <p className="inline-note">适用于原件已到但解析未成功；仅解除缺件，不自动确认净值，不关闭解析异常。</p>
+              </ActionForm>}
               {canWrite && (
                 <Button onClick={onUpload}>
                   <Upload />

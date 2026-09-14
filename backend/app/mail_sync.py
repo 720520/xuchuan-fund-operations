@@ -8,8 +8,9 @@ from email.parser import BytesParser
 from sqlalchemy import select
 
 from .db import now
+from .mail_classification import ensure_mail_item
 from .mailbox_security import open_imap, selectable_folders, stored_config
-from .models import Document, ExceptionTask, Mailbox, MailReceipt, ParseJob
+from .models import Document, ExceptionTask, Mailbox, MailReceipt
 from .security import audit
 from .services import archive, task
 
@@ -79,10 +80,10 @@ def ingest_message(
                     "folder": folder,
                 },
             )
-            if child.filename.lower().endswith(
-                (".xlsx", ".xls", ".csv", ".pdf", ".xlsm")
-            ):
-                db.add(ParseJob(manager_id=mailbox.manager_id, document_id=child.id))
+        ensure_mail_item(db, original, msg)
+    else:
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        ensure_mail_item(db, original, msg)
     db.add(
         MailReceipt(
             mailbox_id=mailbox.id,
@@ -111,7 +112,7 @@ def sync_mailbox(factory, settings, mailbox_id, client_type=None):
         arguments = (config,) if client_type is None else (config, client_type)
         with open_imap(*arguments) as client:
             folders = (
-                selectable_folders(client)
+                selectable_folders(client, exclude_special=True)
                 if box.all_folders
                 else [config.get("folder") or "INBOX"]
             )

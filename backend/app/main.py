@@ -1,7 +1,10 @@
 import hashlib
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -12,26 +15,50 @@ from fastapi import (
     Form,
     HTTPException,
     Request,
+    Query,
     Response,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import schemas as S
 from .config import Settings
+from .calendar_refresh import read_status as calendar_refresh_status
 from .db import connect, now, uid
-from .mailbox_security import encrypt_password, stored_config, test_connection
+from .mail_classification import (
+    apply_manual_classification,
+    full_message_text,
+    safe_message_html,
+)
+from .mailbox_security import (
+    encrypt_password,
+    encrypt_sensitive_value,
+    mask_sensitive_value,
+    stored_config,
+    test_connection,
+)
 from .models import (
     AuditEvent,
     Document,
+    DocumentMaterial,
+    DocumentMaterialInvestor,
+    DocumentMaterialProduct,
     EffectiveNav,
     ExceptionTask,
     LoginAttempt,
+    Investor,
+    InvestorBankAccount,
+    InvestorBankAccountProduct,
+    InvestorProduct,
+    MailAction,
     Mailbox,
+    MailItem,
+    MailItemProduct,
+    MailReceipt,
     Manager,
     Membership,
     NavRecord,
@@ -39,6 +66,8 @@ from .models import (
     Product,
     ProductFiling,
     ProductGrant,
+    ReceiptPolicy,
+    ReceiptExpectation,
     Session,
     ShareClass,
     User,
@@ -56,6 +85,19 @@ from .security import (
     session_user,
     verify_password,
 )
+from .trading_calendar import (
+    CalendarUnavailable,
+    PUBLIC_HOLIDAY_SOURCES,
+    SOURCES,
+    VERSION,
+    expected_on,
+    is_makeup_workday,
+    is_trading_day,
+    month_days,
+    previous_trading_day,
+    public_holiday,
+)
+from .receipts import local_now, lock_missing, mark_resend, match_material
 from .services import (
     add_nav,
     archive,
@@ -112,9 +154,13 @@ def create_app(settings=None):
             "no-store" if request.url.path.startswith("/api") else "no-cache"
         )
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
         )
         return response
+
+    @app.exception_handler(CalendarUnavailable)
+    async def calendar_error(request, exc):
+        return JSONResponse({"detail": str(exc)}, status_code=422)
 
     @app.exception_handler(IntegrityError)
     async def integrity_error(request, exc):
@@ -199,8 +245,240 @@ def create_app(settings=None):
         # Mixed-product attachments must not be leaked through a single product grant.
         if not permissions["archive"]:
             raise HTTPException(403, "原始附件可能含其他产品，须具有牌照全产品查看权限")
+        material = session.get(DocumentMaterial, doc.id)
+        if (
+            material
+            and material.sensitivity == "investor_sensitive"
+            and not permissions["investor_read"]
+        ):
+            raise HTTPException(403, "投资者敏感资料需要单独权限")
+        mail_root_id = doc.parent_id or doc.id
+        if (
+            not permissions["investor_read"]
+            and session.scalar(
+                select(MailItem.id).where(
+                    MailItem.document_id == mail_root_id,
+                    MailItem.category == "investor_redemption",
+                )
+            )
+        ):
+            raise HTTPException(403, "投资者业务邮件及附件需要单独权限")
         require(session, actor, doc.manager_id)
         return doc
+
+    def document_result(doc, job=None, material=None, products=(), investors=()):
+        detail = row(job)
+        if detail:
+            parsed = job.result or {}
+            detail["result"] = {
+                "errors": parsed.get("errors", [])[:25],
+                "error_count": len(parsed.get("errors", [])),
+                "record_ids": parsed.get("record_ids", [])[:100],
+                "record_count": len(parsed.get("record_ids", [])),
+                "parser_version": parsed.get("parser_version"),
+                "skip_reason": parsed.get("skip_reason"),
+            }
+        linked = list(products)
+        linked_investors = list(investors)
+        return {
+            **row(doc, {"storage_key"}),
+            "title": material.title if material else None,
+            "category": material.category if material else None,
+            "material_type": material.material_type if material else None,
+            "business_date": material.business_date if material else None,
+            "period_start": material.period_start if material else None,
+            "period_end": material.period_end if material else None,
+            "notes": material.notes if material else "",
+            "sensitivity": material.sensitivity if material else "standard",
+            "material_status": material.status if material else "pending",
+            "material_revision": material.revision if material else 0,
+            "organized_at": material.confirmed_at if material else None,
+            "organized_by": material.confirmed_by if material else None,
+            "product_ids": [product.id for product in linked],
+            "products": [{"id": product.id, "name": product.name} for product in linked],
+            "investor_ids": [investor.id for investor in linked_investors],
+            "investors": [
+                {
+                    "id": investor.id,
+                    "display_name": investor.display_name,
+                    "investor_type": investor.investor_type,
+                }
+                for investor in linked_investors
+            ],
+            "job": detail,
+        }
+
+    def bank_account_result(session, account):
+        product_ids = list(
+            session.scalars(
+                select(InvestorBankAccountProduct.product_id)
+                .where(InvestorBankAccountProduct.bank_account_id == account.id)
+                .order_by(InvestorBankAccountProduct.product_id)
+            )
+        )
+        return {
+            **row(account, {"account_number_ciphertext"}),
+            "product_ids": product_ids,
+        }
+
+    def investor_result(session, investor, products=(), material_count=0):
+        return {
+            **row(investor, {"certificate_number_ciphertext"}),
+            "products": [
+                {"id": product.id, "name": product.name} for product in products
+            ],
+            "product_ids": [product.id for product in products],
+            "material_count": material_count,
+            "bank_accounts": [
+                bank_account_result(session, account)
+                for account in session.scalars(
+                    select(InvestorBankAccount)
+                    .where(InvestorBankAccount.investor_id == investor.id)
+                    .order_by(InvestorBankAccount.status, InvestorBankAccount.bank_name)
+                )
+            ],
+        }
+
+    def investor_source_document(session, manager_id, investor_id, document_id):
+        if not document_id:
+            return None
+        document = session.get(Document, document_id)
+        if not document or document.manager_id != manager_id:
+            raise HTTPException(422, "字段来源原件不存在或不属于当前牌照")
+        material = session.get(DocumentMaterial, document_id)
+        if not material or material.sensitivity != "investor_sensitive":
+            raise HTTPException(422, "字段来源必须是已归档的投资者敏感资料")
+        linked_investor_ids = set(
+            session.scalars(
+                select(DocumentMaterialInvestor.investor_id).where(
+                    DocumentMaterialInvestor.document_id == document_id
+                )
+            )
+        )
+        if linked_investor_ids and investor_id not in linked_investor_ids:
+            raise HTTPException(422, "字段来源原件已关联其他投资者")
+        if not linked_investor_ids:
+            session.add(
+                DocumentMaterialInvestor(
+                    manager_id=manager_id,
+                    document_id=document_id,
+                    investor_id=investor_id,
+                    created_at=now(),
+                )
+            )
+        return document.id
+
+    def apply_investor_profile(session, investor, data):
+        investor.suitability_class = data.suitability_class
+        investor.professional_investor_type = data.professional_investor_type
+        investor.certificate_type = data.certificate_type
+        if data.clear_certificate_number:
+            investor.certificate_number_ciphertext = None
+            investor.certificate_number_masked = None
+        elif data.certificate_number:
+            investor.certificate_number_ciphertext = encrypt_sensitive_value(
+                settings,
+                "investor_certificate",
+                investor.id,
+                data.certificate_number,
+            )
+            investor.certificate_number_masked = mask_sensitive_value(
+                data.certificate_number
+            )
+        investor.certificate_valid_until = (
+            data.certificate_valid_until.isoformat()
+            if data.certificate_valid_until
+            else None
+        )
+        investor.nationality_or_region = data.nationality_or_region
+        investor.contact_email = data.contact_email
+        investor.contact_phone = data.contact_phone
+        investor.specific_object_status = data.specific_object_status
+        investor.specific_object_confirmed_at = (
+            data.specific_object_confirmed_at.isoformat()
+            if data.specific_object_confirmed_at
+            else None
+        )
+        investor.risk_level = data.risk_level
+        investor.risk_assessed_at = (
+            data.risk_assessed_at.isoformat() if data.risk_assessed_at else None
+        )
+        investor.risk_expires_at = (
+            data.risk_expires_at.isoformat() if data.risk_expires_at else None
+        )
+        investor.qualified_material_status = data.qualified_material_status
+        investor.qualified_material_from = (
+            data.qualified_material_from.isoformat()
+            if data.qualified_material_from
+            else None
+        )
+        investor.qualified_material_until = (
+            data.qualified_material_until.isoformat()
+            if data.qualified_material_until
+            else None
+        )
+        investor.profile_source_document_id = investor_source_document(
+            session, investor.manager_id, investor.id, data.profile_source_document_id
+        )
+        investor.suitability_source_document_id = investor_source_document(
+            session,
+            investor.manager_id,
+            investor.id,
+            data.suitability_source_document_id,
+        )
+
+    def investor_products(session, manager_id, product_ids):
+        products = list(
+            session.scalars(
+                select(Product).where(
+                    Product.manager_id == manager_id,
+                    Product.id.in_(product_ids),
+                )
+            )
+        ) if product_ids else []
+        if len(products) != len(product_ids):
+            raise HTTPException(422, "关联产品不存在或不属于当前牌照")
+        return products
+
+    def replace_investor_products(session, actor, investor, product_ids):
+        products = investor_products(session, investor.manager_id, product_ids)
+        session.execute(
+            delete(InvestorProduct).where(
+                InvestorProduct.investor_id == investor.id
+            )
+        )
+        timestamp = now()
+        for product_id in product_ids:
+            session.add(
+                InvestorProduct(
+                    manager_id=investor.manager_id,
+                    investor_id=investor.id,
+                    product_id=product_id,
+                    status="confirmed",
+                    created_by=actor.id,
+                    created_at=timestamp,
+                )
+            )
+        products.sort(key=lambda product: product.name)
+        return products
+
+    def replace_bank_account_products(session, account, product_ids):
+        investor_products(session, account.manager_id, product_ids)
+        session.execute(
+            delete(InvestorBankAccountProduct).where(
+                InvestorBankAccountProduct.bank_account_id == account.id
+            )
+        )
+        timestamp = now()
+        for product_id in product_ids:
+            session.add(
+                InvestorBankAccountProduct(
+                    manager_id=account.manager_id,
+                    bank_account_id=account.id,
+                    product_id=product_id,
+                    created_at=timestamp,
+                )
+            )
 
     def get_issue(session, actor, issue_id):
         issue = session.get(ExceptionTask, issue_id)
@@ -564,6 +842,54 @@ def create_app(settings=None):
         )
         return {"ok": True}
 
+    @app.get("/api/managers/{manager_id}/receipt-policy")
+    def receipt_policy(manager_id: str, actor=Depends(user), session=Depends(db, scope="function")):
+        manager_permission(session, actor, manager_id)
+        policy = session.get(ReceiptPolicy, manager_id)
+        today = local_now().date()
+        error, suggested = None, None
+        try:
+            suggested = previous_trading_day(today).isoformat()
+            is_trading_day(today)
+        except CalendarUnavailable as exc:
+            error = str(exc)
+        value = row(policy) if policy else {
+            "enabled": False, "start_date": today.isoformat(), "followup_time": "09:00",
+            "last_checked_at": None, "error": None,
+        }
+        return {**value, "calendar": VERSION, "calendar_sources": SOURCES,
+                "calendar_error": error, "suggested_valuation_date": suggested}
+
+    @app.put("/api/managers/{manager_id}/receipt-policy")
+    def save_receipt_policy(manager_id: str, data: S.ReceiptPolicyInput,
+                            actor=Depends(user), session=Depends(db, scope="function")):
+        require(session, actor, manager_id, "admin")
+        # Manager lock serializes first-time policy creation too.
+        session.scalar(select(Manager).where(Manager.id == manager_id).with_for_update())
+        policy = session.get(ReceiptPolicy, manager_id)
+        today = local_now().date()
+        if data.enabled:
+            is_trading_day(data.start_date)
+            previous_trading_day(data.start_date)
+            is_trading_day(today)
+        if not policy and data.start_date < today:
+            raise HTTPException(422, "首次启用从今天或未来开始，不自动追补启用前的缺件")
+        if policy and data.start_date.isoformat() != policy.start_date:
+            raise HTTPException(422, "启用起始日已留痕，不可修改；停用或启用开关控制后续检查")
+        before = row(policy)
+        if not policy:
+            policy = ReceiptPolicy(manager_id=manager_id, start_date=data.start_date.isoformat())
+            session.add(policy)
+        if data.enabled and before and not before["enabled"]:
+            # A deliberate pause is not an outage: don't invent obligations during the pause.
+            policy.last_scheduled_date = max(today.isoformat(), policy.start_date)
+        policy.enabled, policy.followup_time = data.enabled, data.followup_time
+        policy.error, policy.last_checked_at = None, None
+        session.flush()
+        audit(session, actor, manager_id, "receipt.policy_updated", manager_id,
+              {"before": before, "after": row(policy), "calendar": VERSION})
+        return row(policy)
+
     @app.get("/api/managers/{manager_id}/summary")
     def summary(
         manager_id: str,
@@ -586,17 +912,12 @@ def create_app(settings=None):
             .astimezone(timezone.utc)
             .isoformat()
         )
-        expected_shares = list(
-            session.scalars(
-                select(ShareClass.id)
-                .join(Product, Product.id == ShareClass.product_id)
-                .where(
-                    Product.id.in_(pids),
-                    Product.expected.is_(True),
-                    Product.frequency != "off",
-                )
-            )
-        )
+        expected_products = [product.id for product in session.scalars(
+            select(Product).where(Product.id.in_(pids))
+        ) if expected_on(product, valuation_date)]
+        expected_shares = list(session.scalars(select(ShareClass.id).where(
+            ShareClass.product_id.in_(expected_products)
+        )))
         confirmed = session.scalar(
             select(func.count())
             .select_from(EffectiveNav)
@@ -605,12 +926,15 @@ def create_app(settings=None):
                 EffectiveNav.valuation_date == valuation_date.isoformat(),
             )
         )
-        received = session.scalar(
-            select(func.count(func.distinct(NavRecord.share_id))).where(
-                NavRecord.share_id.in_(expected_shares),
-                NavRecord.valuation_date == valuation_date.isoformat(),
-            )
-        )
+        received_shares = set(session.scalars(select(NavRecord.share_id).where(
+            NavRecord.share_id.in_(expected_shares), NavRecord.valuation_date == valuation_date.isoformat(),
+        )))
+        received_shares.update(session.scalars(select(ReceiptExpectation.share_id).where(
+            ReceiptExpectation.share_id.in_(expected_shares),
+            ReceiptExpectation.valuation_date == valuation_date.isoformat(),
+            ReceiptExpectation.received_at.is_not(None),
+        )))
+        received = len(received_shares)
         archived = (
             session.scalar(
                 select(func.count())
@@ -642,7 +966,7 @@ def create_app(settings=None):
             "confirmed": confirmed,
             "archived": archived,
             "processed_today": processed_today,
-            "calendar": "explicit-date",
+            "calendar": VERSION,
         }
 
     @app.put("/api/products/{product_id}/schedule")
@@ -658,9 +982,17 @@ def create_app(settings=None):
         require(session, actor, p.manager_id, "admin")
         if p.lifecycle_status in {"liquidated", "archived"}:
             raise HTTPException(422, "已清算或已归档产品不能修改应收配置")
+        if data.frequency == "daily":
+            data.cutoff = "15:00"
         before = {key: getattr(p, key) for key in data.model_fields_set}
         for key, value in data.model_dump().items():
             setattr(p, key, value)
+        if not p.expected or p.frequency == "off":
+            from .receipts import reconcile
+            for expectation in session.scalars(select(ReceiptExpectation).where(
+                ReceiptExpectation.product_id == p.id, ReceiptExpectation.cancelled.is_(False),
+            )):
+                reconcile(session, expectation, local_now())
         audit(
             session,
             actor,
@@ -786,19 +1118,329 @@ def create_app(settings=None):
             "metric_basis": "单位净值变化 / 净值回撤，不是分红再投资总回报",
         }
 
+    @app.get("/api/managers/{manager_id}/investors")
+    def investors(
+        manager_id: str, actor=Depends(user), session=Depends(db, scope="function")
+    ):
+        require(session, actor, manager_id, "investor_read")
+        records = list(
+            session.scalars(
+                select(Investor)
+                .where(Investor.manager_id == manager_id)
+                .order_by(Investor.display_name, Investor.created_at)
+            )
+        )
+        if not records:
+            return []
+        investor_ids = [record.id for record in records]
+        products_by_investor = {investor_id: [] for investor_id in investor_ids}
+        for investor_id, product in session.execute(
+            select(InvestorProduct.investor_id, Product)
+            .join(Product, Product.id == InvestorProduct.product_id)
+            .where(InvestorProduct.investor_id.in_(investor_ids))
+            .order_by(Product.name)
+        ):
+            products_by_investor[investor_id].append(product)
+        material_counts = dict(
+            session.execute(
+                select(
+                    DocumentMaterialInvestor.investor_id,
+                    func.count(DocumentMaterialInvestor.id),
+                )
+                .where(DocumentMaterialInvestor.investor_id.in_(investor_ids))
+                .group_by(DocumentMaterialInvestor.investor_id)
+            ).all()
+        )
+        return [
+            investor_result(
+                session,
+                record,
+                products_by_investor[record.id],
+                material_counts.get(record.id, 0),
+            )
+            for record in records
+        ]
+
+    @app.post("/api/managers/{manager_id}/investors", status_code=201)
+    def create_investor(
+        manager_id: str,
+        data: S.InvestorSave,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        require(session, actor, manager_id, "investor_write")
+        if data.revision != 0:
+            raise HTTPException(409, "新投资者记录的版本必须从零开始")
+        investor_products(session, manager_id, data.product_ids)
+        investor = Investor(
+            manager_id=manager_id,
+            investor_type=data.investor_type,
+            display_name=data.display_name,
+            status=data.status,
+            source=data.source,
+            notes=data.notes,
+            created_by=actor.id,
+        )
+        session.add(investor)
+        session.flush()
+        apply_investor_profile(session, investor, data)
+        products = replace_investor_products(
+            session, actor, investor, data.product_ids
+        )
+        audit(
+            session,
+            actor,
+            manager_id,
+            "investor.created",
+            investor.id,
+            {
+                "investor_type": investor.investor_type,
+                "suitability_class": investor.suitability_class,
+                "status": investor.status,
+                "source": investor.source,
+                "product_ids": data.product_ids,
+                "certificate_number_changed": bool(data.certificate_number),
+            },
+        )
+        return investor_result(session, investor, products, 0)
+
+    @app.put("/api/investors/{investor_id}")
+    def update_investor(
+        investor_id: str,
+        data: S.InvestorSave,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        investor = session.scalar(
+            select(Investor).where(Investor.id == investor_id).with_for_update()
+        )
+        if not investor:
+            raise HTTPException(404, "投资者记录不存在")
+        require(session, actor, investor.manager_id, "investor_write")
+        if investor.revision != data.revision:
+            raise HTTPException(409, "投资者信息已经变化，请刷新后重试")
+        previous_product_ids = list(
+            session.scalars(
+                select(InvestorProduct.product_id).where(
+                    InvestorProduct.investor_id == investor.id
+                )
+            )
+        )
+        before = {
+            "investor_type": investor.investor_type,
+            "suitability_class": investor.suitability_class,
+            "specific_object_status": investor.specific_object_status,
+            "qualified_material_status": investor.qualified_material_status,
+            "status": investor.status,
+            "source": investor.source,
+            "product_ids": previous_product_ids,
+            "revision": investor.revision,
+        }
+        investor.investor_type = data.investor_type
+        investor.display_name = data.display_name
+        investor.status = data.status
+        investor.source = data.source
+        investor.notes = data.notes
+        certificate_number_changed = bool(
+            data.certificate_number or data.clear_certificate_number
+        )
+        apply_investor_profile(session, investor, data)
+        investor.updated_at = now()
+        investor.revision += 1
+        products = replace_investor_products(
+            session, actor, investor, data.product_ids
+        )
+        audit(
+            session,
+            actor,
+            investor.manager_id,
+            "investor.updated",
+            investor.id,
+            {
+                "before": before,
+                "after": {
+                    "investor_type": investor.investor_type,
+                    "suitability_class": investor.suitability_class,
+                    "specific_object_status": investor.specific_object_status,
+                    "qualified_material_status": investor.qualified_material_status,
+                    "status": investor.status,
+                    "source": investor.source,
+                    "product_ids": data.product_ids,
+                    "revision": investor.revision,
+                    "certificate_number_changed": certificate_number_changed,
+                },
+            },
+        )
+        return investor_result(
+            session,
+            investor,
+            products,
+            session.scalar(
+                select(func.count(DocumentMaterialInvestor.id)).where(
+                    DocumentMaterialInvestor.investor_id == investor.id
+                )
+            ),
+        )
+
+    @app.post("/api/investors/{investor_id}/bank-accounts", status_code=201)
+    def create_investor_bank_account(
+        investor_id: str,
+        data: S.InvestorBankAccountSave,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        investor = session.get(Investor, investor_id)
+        if not investor:
+            raise HTTPException(404, "投资者记录不存在")
+        require(session, actor, investor.manager_id, "investor_write")
+        if data.revision != 0:
+            raise HTTPException(409, "新银行账户的版本必须从零开始")
+        if not data.account_number:
+            raise HTTPException(422, "新增银行账户必须填写账号")
+        account_id = uid()
+        account = InvestorBankAccount(
+            id=account_id,
+            manager_id=investor.manager_id,
+            investor_id=investor.id,
+            account_name=data.account_name,
+            account_number_ciphertext=encrypt_sensitive_value(
+                settings,
+                "investor_bank_account",
+                account_id,
+                data.account_number,
+            ),
+            account_number_masked=mask_sensitive_value(data.account_number),
+            bank_name=data.bank_name,
+            branch_name=data.branch_name,
+            currency=data.currency.upper(),
+            status=data.status,
+            source_document_id=investor_source_document(
+                session, investor.manager_id, investor.id, data.source_document_id
+            ),
+            created_by=actor.id,
+        )
+        session.add(account)
+        session.flush()
+        replace_bank_account_products(session, account, data.product_ids)
+        audit(
+            session,
+            actor,
+            investor.manager_id,
+            "investor.bank_account_created",
+            account.id,
+            {
+                "investor_id": investor.id,
+                "bank_name": account.bank_name,
+                "currency": account.currency,
+                "status": account.status,
+                "product_ids": data.product_ids,
+                "source_document_id": account.source_document_id,
+            },
+        )
+        return bank_account_result(session, account)
+
+    @app.put("/api/investor-bank-accounts/{account_id}")
+    def update_investor_bank_account(
+        account_id: str,
+        data: S.InvestorBankAccountSave,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        account = session.scalar(
+            select(InvestorBankAccount)
+            .where(InvestorBankAccount.id == account_id)
+            .with_for_update()
+        )
+        if not account:
+            raise HTTPException(404, "银行账户不存在")
+        require(session, actor, account.manager_id, "investor_write")
+        if account.revision != data.revision:
+            raise HTTPException(409, "银行账户已经变化，请刷新后重试")
+        before = {
+            "bank_name": account.bank_name,
+            "currency": account.currency,
+            "status": account.status,
+            "product_ids": list(
+                session.scalars(
+                    select(InvestorBankAccountProduct.product_id).where(
+                        InvestorBankAccountProduct.bank_account_id == account.id
+                    )
+                )
+            ),
+            "revision": account.revision,
+        }
+        account.account_name = data.account_name
+        if data.account_number:
+            account.account_number_ciphertext = encrypt_sensitive_value(
+                settings,
+                "investor_bank_account",
+                account.id,
+                data.account_number,
+            )
+            account.account_number_masked = mask_sensitive_value(
+                data.account_number
+            )
+        account.bank_name = data.bank_name
+        account.branch_name = data.branch_name
+        account.currency = data.currency.upper()
+        account.status = data.status
+        account.source_document_id = investor_source_document(
+            session,
+            account.manager_id,
+            account.investor_id,
+            data.source_document_id,
+        )
+        account.updated_at = now()
+        account.revision += 1
+        replace_bank_account_products(session, account, data.product_ids)
+        audit(
+            session,
+            actor,
+            account.manager_id,
+            "investor.bank_account_updated",
+            account.id,
+            {
+                "before": before,
+                "after": {
+                    "bank_name": account.bank_name,
+                    "currency": account.currency,
+                    "status": account.status,
+                    "product_ids": data.product_ids,
+                    "revision": account.revision,
+                    "account_number_changed": bool(data.account_number),
+                    "source_document_id": account.source_document_id,
+                },
+            },
+        )
+        return bank_account_result(session, account)
+
     @app.post("/api/managers/{manager_id}/documents", status_code=201)
     async def upload(
         manager_id: str,
         file: UploadFile = File(...),
         product_id: str | None = Form(None),
+        investor_id: str | None = Form(None),
+        material_scope: str | None = Form(None),
         actor=Depends(user),
         session=Depends(db, scope="function"),
     ):
         require(session, actor, manager_id, "write")
+        if material_scope not in {None, "product", "investor"}:
+            raise HTTPException(422, "资料目录范围不正确")
+        if material_scope == "product" and not product_id:
+            raise HTTPException(422, "从产品目录上传时必须指定产品")
+        if material_scope == "investor" and not investor_id:
+            raise HTTPException(422, "从投资者目录上传时必须指定投资者")
         if product_id:
             p = get_product(session, actor, product_id, "write")
             if p.manager_id != manager_id:
                 raise HTTPException(422, "产品与牌照不一致")
+        linked_investor = None
+        if investor_id:
+            require(session, actor, manager_id, "investor_write")
+            linked_investor = session.get(Investor, investor_id)
+            if not linked_investor or linked_investor.manager_id != manager_id:
+                raise HTTPException(422, "投资者不存在或不属于当前牌照")
         content = await file.read(settings.max_upload + 1)
         await file.close()
         doc = archive(
@@ -811,36 +1453,618 @@ def create_app(settings=None):
             actor,
             product_id,
         )
-        session.add(ParseJob(manager_id=manager_id, document_id=doc.id))
+        job = ParseJob(manager_id=manager_id, document_id=doc.id)
+        session.add(job)
         session.flush()
+        if linked_investor or material_scope == "product":
+            timestamp = now()
+            is_investor_material = linked_investor is not None
+            material = DocumentMaterial(
+                document_id=doc.id,
+                manager_id=manager_id,
+                category="other",
+                title=doc.filename,
+                notes=(
+                    "从投资者目录上传，资料类别待人工整理"
+                    if is_investor_material
+                    else "从产品目录上传，资料类别待人工整理"
+                ),
+                sensitivity="investor_sensitive" if is_investor_material else "standard",
+                status="pending",
+                confirmed_by=actor.id,
+                confirmed_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+                revision=1,
+            )
+            session.add(material)
+            session.flush()
+            if linked_investor:
+                session.add(
+                    DocumentMaterialInvestor(
+                        manager_id=manager_id,
+                        document_id=doc.id,
+                        investor_id=linked_investor.id,
+                        created_at=timestamp,
+                    )
+                )
+            if product_id:
+                session.add(
+                    DocumentMaterialProduct(
+                        manager_id=manager_id,
+                        document_id=doc.id,
+                        product_id=product_id,
+                        created_at=timestamp,
+                    )
+                )
+            job.status = "skipped"
+            job.result = {
+                "skip_reason": (
+                    "投资者敏感资料已安全归档，等待人工确认资料类别"
+                    if is_investor_material
+                    else "产品资料已安全归档，等待人工确认资料类别"
+                )
+            }
+            job.updated_at = timestamp
+            audit(
+                session,
+                actor,
+                manager_id,
+                "document.investor_linked" if is_investor_material else "document.product_linked",
+                doc.id,
+                {
+                    "investor_id": linked_investor.id if linked_investor else None,
+                    "product_id": product_id,
+                    "material_scope": material_scope or "investor",
+                    "sensitivity": "investor_sensitive" if is_investor_material else "standard",
+                },
+            )
         # Raw evidence + durable queue are committed together, parsing is in a separate worker.
         return row(doc, {"storage_key"})
 
     @app.get("/api/managers/{manager_id}/documents")
     def documents(
-        manager_id: str, actor=Depends(user), session=Depends(db, scope="function")
+        manager_id: str,
+        paginated: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        q: str = "",
+        status: str = "all",
+        product_id: str = "",
+        investor_id: str = "",
+        category: str = "",
+        source: str = "",
+        sensitivity: str = "",
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
     ):
-        require(session, actor, manager_id, "archive")
-        result = []
-        for doc in session.scalars(
-            select(Document)
-            .where(Document.manager_id == manager_id)
-            .order_by(Document.received_at.desc())
-            .limit(300)
+        permissions = require(session, actor, manager_id, "archive")
+        page_result = None
+        if paginated:
+            if not 1 <= limit <= 100 or offset < 0:
+                raise HTTPException(422, "分页参数超出允许范围")
+            if status not in {"all", "pending", "linked", "attention"}:
+                raise HTTPException(422, "资料状态筛选无效")
+            if category not in {
+                "",
+                "pending",
+                "nav_valuation",
+                "contract",
+                "investor_qualification",
+                "subscription_redemption",
+                "filing",
+                "custody_account",
+                "periodic_report",
+                "risk_compliance",
+                "operation_evidence",
+                "other",
+            }:
+                raise HTTPException(422, "资料类别筛选无效")
+            if sensitivity not in {"", "standard", "investor_sensitive"}:
+                raise HTTPException(422, "敏感级别筛选无效")
+
+            material_ids = select(DocumentMaterial.document_id).where(
+                DocumentMaterial.manager_id == manager_id
+            )
+            organized_ids = select(DocumentMaterial.document_id).where(
+                DocumentMaterial.manager_id == manager_id,
+                DocumentMaterial.status == "organized",
+            )
+            sensitive_ids = select(DocumentMaterial.document_id).where(
+                DocumentMaterial.manager_id == manager_id,
+                DocumentMaterial.sensitivity == "investor_sensitive",
+            )
+            product_link_ids = select(DocumentMaterialProduct.document_id).where(
+                DocumentMaterialProduct.manager_id == manager_id
+            )
+            investor_link_ids = select(DocumentMaterialInvestor.document_id).where(
+                DocumentMaterialInvestor.manager_id == manager_id
+            )
+            attention_ids = select(ParseJob.document_id).where(
+                ParseJob.manager_id == manager_id,
+                ParseJob.status.in_({"queued", "processing", "review"}),
+            )
+            sensitive_mail_roots = select(MailItem.document_id).where(
+                MailItem.manager_id == manager_id,
+                MailItem.category == "investor_redemption",
+            )
+            accessible = select(Document.id).where(
+                Document.manager_id == manager_id,
+                ~func.lower(Document.filename).like("%.eml"),
+            )
+            if not permissions["investor_read"]:
+                accessible = accessible.where(
+                    ~Document.id.in_(sensitive_ids),
+                    ~Document.id.in_(sensitive_mail_roots),
+                    or_(
+                        Document.parent_id.is_(None),
+                        ~Document.parent_id.in_(sensitive_mail_roots),
+                    ),
+                )
+
+            linked_condition = or_(
+                Document.product_id.is_not(None),
+                Document.id.in_(product_link_ids),
+                Document.id.in_(investor_link_ids),
+            )
+            pending_condition = ~Document.id.in_(organized_ids)
+            attention_condition = Document.id.in_(attention_ids)
+
+            def count_documents(condition=None):
+                statement = accessible
+                if condition is not None:
+                    statement = statement.where(condition)
+                return session.scalar(
+                    select(func.count()).select_from(statement.subquery())
+                ) or 0
+
+            counts = {
+                "all": count_documents(),
+                "pending": count_documents(pending_condition),
+                "linked": count_documents(linked_condition),
+                "attention": count_documents(attention_condition),
+            }
+            filtered = accessible
+            if status == "pending":
+                filtered = filtered.where(pending_condition)
+            elif status == "linked":
+                filtered = filtered.where(linked_condition)
+            elif status == "attention":
+                filtered = filtered.where(attention_condition)
+            if product_id:
+                filtered = filtered.where(
+                    or_(
+                        Document.product_id == product_id,
+                        Document.id.in_(
+                            select(DocumentMaterialProduct.document_id).where(
+                                DocumentMaterialProduct.manager_id == manager_id,
+                                DocumentMaterialProduct.product_id == product_id,
+                            )
+                        ),
+                    )
+                )
+            if investor_id:
+                filtered = filtered.where(
+                    Document.id.in_(
+                        select(DocumentMaterialInvestor.document_id).where(
+                            DocumentMaterialInvestor.manager_id == manager_id,
+                            DocumentMaterialInvestor.investor_id == investor_id,
+                        )
+                    )
+                )
+            if category == "pending":
+                filtered = filtered.where(pending_condition)
+            elif category:
+                category_ids = select(DocumentMaterial.document_id).where(
+                    DocumentMaterial.manager_id == manager_id,
+                    DocumentMaterial.category == category,
+                )
+                if category == "nav_valuation":
+                    completed_ids = select(ParseJob.document_id).where(
+                        ParseJob.manager_id == manager_id,
+                        ParseJob.status == "completed",
+                    )
+                    filtered = filtered.where(
+                        or_(
+                            Document.id.in_(category_ids),
+                            Document.id.in_(completed_ids),
+                        )
+                    )
+                elif category == "operation_evidence":
+                    filtered = filtered.where(
+                        or_(
+                            Document.id.in_(category_ids),
+                            Document.source == "lifecycle_material",
+                        )
+                    )
+                else:
+                    filtered = filtered.where(Document.id.in_(category_ids))
+            if source:
+                filtered = filtered.where(Document.source == source)
+            if sensitivity == "investor_sensitive":
+                filtered = filtered.where(Document.id.in_(sensitive_ids))
+            elif sensitivity == "standard":
+                filtered = filtered.where(~Document.id.in_(sensitive_ids))
+            query_text = q.strip().lower()[:200]
+            if query_text:
+                pattern = f"%{query_text}%"
+                matching_materials = select(DocumentMaterial.document_id).where(
+                    DocumentMaterial.manager_id == manager_id,
+                    or_(
+                        func.lower(DocumentMaterial.title).like(pattern),
+                        func.lower(DocumentMaterial.notes).like(pattern),
+                    ),
+                )
+                matching_product_links = (
+                    select(DocumentMaterialProduct.document_id)
+                    .join(Product, Product.id == DocumentMaterialProduct.product_id)
+                    .where(
+                        DocumentMaterialProduct.manager_id == manager_id,
+                        or_(
+                            func.lower(Product.name).like(pattern),
+                            func.lower(Product.code).like(pattern),
+                        ),
+                    )
+                )
+                matching_legacy_products = select(Product.id).where(
+                    Product.manager_id == manager_id,
+                    or_(
+                        func.lower(Product.name).like(pattern),
+                        func.lower(Product.code).like(pattern),
+                    ),
+                )
+                matching_investor_links = (
+                    select(DocumentMaterialInvestor.document_id)
+                    .join(Investor, Investor.id == DocumentMaterialInvestor.investor_id)
+                    .where(
+                        DocumentMaterialInvestor.manager_id == manager_id,
+                        func.lower(Investor.display_name).like(pattern),
+                    )
+                )
+                filtered = filtered.where(
+                    or_(
+                        func.lower(Document.filename).like(pattern),
+                        func.lower(cast(Document.metadata_json, String)).like(pattern),
+                        Document.id.in_(matching_materials),
+                        Document.id.in_(matching_product_links),
+                        Document.product_id.in_(matching_legacy_products),
+                        Document.id.in_(matching_investor_links),
+                    )
+                )
+            total = session.scalar(
+                select(func.count()).select_from(filtered.subquery())
+            ) or 0
+            documents = list(
+                session.scalars(
+                    select(Document)
+                    .where(Document.id.in_(filtered))
+                    .order_by(Document.received_at.desc(), Document.id.desc())
+                    .offset(offset)
+                    .limit(limit)
+                )
+            )
+            page_result = {
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "counts": counts,
+            }
+        else:
+            documents = list(session.scalars(
+                select(Document)
+                .where(Document.manager_id == manager_id)
+                .order_by(Document.received_at.desc())
+                .limit(300)
+            ))
+        if not documents:
+            return {**page_result, "items": []} if page_result else []
+        document_ids = [doc.id for doc in documents]
+        jobs = {
+            job.document_id: job
+            for job in session.scalars(
+                select(ParseJob).where(ParseJob.document_id.in_(document_ids))
+            )
+        }
+        materials = {
+            material.document_id: material
+            for material in session.scalars(
+                select(DocumentMaterial).where(
+                    DocumentMaterial.document_id.in_(document_ids)
+                )
+            )
+        }
+        if not permissions["investor_read"]:
+            mail_root_ids = {doc.parent_id or doc.id for doc in documents}
+            sensitive_mail_roots = set(
+                session.scalars(
+                    select(MailItem.document_id).where(
+                        MailItem.manager_id == manager_id,
+                        MailItem.document_id.in_(mail_root_ids),
+                        MailItem.category == "investor_redemption",
+                    )
+                )
+            )
+            documents = [
+                doc
+                for doc in documents
+                if (doc.parent_id or doc.id) not in sensitive_mail_roots
+                and (
+                    materials.get(doc.id) is None
+                    or materials[doc.id].sensitivity != "investor_sensitive"
+                )
+            ]
+            document_ids = [doc.id for doc in documents]
+            if not documents:
+                return []
+        links_by_document = {}
+        for link in session.scalars(
+            select(DocumentMaterialProduct).where(
+                DocumentMaterialProduct.document_id.in_(document_ids)
+            )
         ):
-            job = session.scalar(select(ParseJob).where(ParseJob.document_id == doc.id))
-            detail = row(job)
-            if detail:
-                parsed = job.result or {}
-                detail["result"] = {
-                    "errors": parsed.get("errors", [])[:25],
-                    "error_count": len(parsed.get("errors", [])),
-                    "record_ids": parsed.get("record_ids", [])[:100],
-                    "record_count": len(parsed.get("record_ids", [])),
-                    "parser_version": parsed.get("parser_version"),
+            links_by_document.setdefault(link.document_id, []).append(link.product_id)
+        investor_links_by_document = {}
+        for link in session.scalars(
+            select(DocumentMaterialInvestor).where(
+                DocumentMaterialInvestor.document_id.in_(document_ids)
+            )
+        ):
+            investor_links_by_document.setdefault(link.document_id, []).append(
+                link.investor_id
+            )
+        referenced_product_ids = {
+            product_id
+            for doc in documents
+            for product_id in (
+                links_by_document.get(doc.id, [])
+                if doc.id in materials
+                else ([doc.product_id] if doc.product_id else [])
+            )
+        }
+        product_by_id = {
+            product.id: product
+            for product in session.scalars(
+                select(Product).where(Product.id.in_(referenced_product_ids))
+            )
+        } if referenced_product_ids else {}
+        referenced_investor_ids = {
+            investor_id
+            for investor_ids in investor_links_by_document.values()
+            for investor_id in investor_ids
+        }
+        investor_by_id = {
+            investor.id: investor
+            for investor in session.scalars(
+                select(Investor).where(Investor.id.in_(referenced_investor_ids))
+            )
+        } if referenced_investor_ids else {}
+        result = []
+        for doc in documents:
+            product_ids = (
+                links_by_document.get(doc.id, [])
+                if doc.id in materials
+                else ([doc.product_id] if doc.product_id else [])
+            )
+            linked_products = sorted(
+                (product_by_id[item] for item in product_ids if item in product_by_id),
+                key=lambda product: product.name,
+            )
+            linked_investors = sorted(
+                (
+                    investor_by_id[item]
+                    for item in investor_links_by_document.get(doc.id, [])
+                    if item in investor_by_id
+                ),
+                key=lambda investor: investor.display_name,
+            )
+            result.append(
+                document_result(
+                    doc,
+                    jobs.get(doc.id),
+                    materials.get(doc.id),
+                    linked_products,
+                    linked_investors,
+                )
+            )
+        return {**page_result, "items": result} if page_result else result
+
+    @app.put("/api/documents/{document_id}/material")
+    def organize_document(
+        document_id: str,
+        data: S.MaterialOrganization,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        doc = get_document(session, actor, document_id)
+        require(session, actor, doc.manager_id, "write")
+        if doc.media_type == "message/rfc822" or doc.filename.lower().endswith(".eml"):
+            raise HTTPException(422, "邮件正文作为通信原件保留，请整理其附件")
+
+        product_ids = data.product_ids
+        linked_products = list(
+            session.scalars(
+                select(Product).where(
+                    Product.manager_id == doc.manager_id,
+                    Product.id.in_(product_ids),
+                )
+            )
+        ) if product_ids else []
+        if len(linked_products) != len(product_ids):
+            raise HTTPException(422, "关联产品不存在或不属于当前牌照")
+        investor_ids = data.investor_ids
+        if investor_ids or data.sensitivity == "investor_sensitive":
+            require(session, actor, doc.manager_id, "investor_write")
+        if investor_ids and data.sensitivity != "investor_sensitive":
+            raise HTTPException(422, "关联投资者的资料必须标记为投资者敏感资料")
+        if (
+            data.category in {"investor_qualification", "subscription_redemption"}
+            and data.sensitivity != "investor_sensitive"
+        ):
+            raise HTTPException(422, "投资者资料类别必须使用敏感资料权限")
+        linked_investors = list(
+            session.scalars(
+                select(Investor).where(
+                    Investor.manager_id == doc.manager_id,
+                    Investor.id.in_(investor_ids),
+                )
+            )
+        ) if investor_ids else []
+        if len(linked_investors) != len(investor_ids):
+            raise HTTPException(422, "关联投资者不存在或不属于当前牌照")
+
+        material = session.scalar(
+            select(DocumentMaterial)
+            .where(DocumentMaterial.document_id == doc.id)
+            .with_for_update()
+        )
+        previous_product_ids = []
+        previous_investor_ids = []
+        if material:
+            if material.revision != data.revision:
+                raise HTTPException(409, "资料整理结果已经变化，请刷新后重试")
+            previous_product_ids = list(
+                session.scalars(
+                    select(DocumentMaterialProduct.product_id).where(
+                        DocumentMaterialProduct.document_id == doc.id
+                    )
+                )
+            )
+            previous_investor_ids = list(
+                session.scalars(
+                    select(DocumentMaterialInvestor.investor_id).where(
+                        DocumentMaterialInvestor.document_id == doc.id
+                    )
+                )
+            )
+            before = {
+                "category": material.category,
+                "material_type": material.material_type,
+                "title": material.title,
+                "business_date": material.business_date,
+                "period_start": material.period_start,
+                "period_end": material.period_end,
+                "product_ids": previous_product_ids,
+                "investor_ids": previous_investor_ids,
+                "sensitivity": material.sensitivity,
+                "notes": material.notes,
+                "revision": material.revision,
+            }
+            material.revision += 1
+        else:
+            if data.revision != 0:
+                raise HTTPException(409, "资料尚未整理，请刷新后重试")
+            before = None
+            material = DocumentMaterial(
+                document_id=doc.id,
+                manager_id=doc.manager_id,
+                confirmed_by=actor.id,
+                revision=1,
+            )
+            session.add(material)
+
+        timestamp = now()
+        material.category = data.category
+        material.material_type = data.material_type
+        material.title = data.title or None
+        material.business_date = data.business_date.isoformat() if data.business_date else None
+        material.period_start = data.period_start.isoformat() if data.period_start else None
+        material.period_end = data.period_end.isoformat() if data.period_end else None
+        material.notes = data.notes
+        material.sensitivity = data.sensitivity
+        material.status = "organized"
+        material.confirmed_by = actor.id
+        material.confirmed_at = timestamp
+        material.updated_at = timestamp
+        if before is None:
+            material.created_at = timestamp
+        session.flush()
+
+        session.execute(
+            delete(DocumentMaterialProduct).where(
+                DocumentMaterialProduct.document_id == doc.id
+            )
+        )
+        for product_id in product_ids:
+            session.add(
+                DocumentMaterialProduct(
+                    manager_id=doc.manager_id,
+                    document_id=doc.id,
+                    product_id=product_id,
+                    created_at=timestamp,
+                )
+            )
+        session.execute(
+            delete(DocumentMaterialInvestor).where(
+                DocumentMaterialInvestor.document_id == doc.id
+            )
+        )
+        for investor_id in investor_ids:
+            session.add(
+                DocumentMaterialInvestor(
+                    manager_id=doc.manager_id,
+                    document_id=doc.id,
+                    investor_id=investor_id,
+                    created_at=timestamp,
+                )
+            )
+
+        job = session.scalar(
+            select(ParseJob)
+            .where(ParseJob.document_id == doc.id)
+            .with_for_update()
+        )
+        if data.category == "nav_valuation":
+            parsed_records = (job.result or {}).get("record_ids", []) if job else []
+            if not job:
+                job = ParseJob(manager_id=doc.manager_id, document_id=doc.id)
+                session.add(job)
+            elif not parsed_records and job.status not in {"queued", "processing"}:
+                job.status = "queued"
+                job.result = {
+                    key: value
+                    for key, value in (job.result or {}).items()
+                    if key != "skip_reason"
                 }
-            result.append({**row(doc, {"storage_key"}), "job": detail})
-        return result
+                job.updated_at = timestamp
+        elif (
+            job
+            and not (job.result or {}).get("record_ids")
+            and job.status not in {"processing", "skipped"}
+        ):
+            job.status = "skipped"
+            job.result = {
+                **(job.result or {}),
+                "skip_reason": "资料已人工确认为非净值类别，不进入净值解析",
+            }
+            job.updated_at = timestamp
+
+        after = {
+            "category": material.category,
+            "material_type": material.material_type,
+            "title": material.title,
+            "business_date": material.business_date,
+            "period_start": material.period_start,
+            "period_end": material.period_end,
+            "product_ids": product_ids,
+            "investor_ids": investor_ids,
+            "sensitivity": material.sensitivity,
+            "notes": material.notes,
+            "revision": material.revision,
+        }
+        audit(
+            session,
+            actor,
+            doc.manager_id,
+            "document.material_organized",
+            doc.id,
+            {"before": before, "after": after},
+        )
+        session.flush()
+        linked_products.sort(key=lambda product: product.name)
+        linked_investors.sort(key=lambda investor: investor.display_name)
+        return document_result(
+            doc, job, material, linked_products, linked_investors
+        )
 
     @app.get("/api/documents/{document_id}/download")
     def download(
@@ -869,6 +2093,9 @@ def create_app(settings=None):
         if not doc:
             raise HTTPException(404, "原件不存在")
         require(session, actor, doc.manager_id, "member")
+        material = session.get(DocumentMaterial, doc.id)
+        if material and material.category != "nav_valuation":
+            raise HTTPException(422, "该资料已确认为非净值类别，不进入净值解析")
         job = session.scalar(
             select(ParseJob).where(ParseJob.document_id == doc.id).with_for_update()
         )
@@ -936,6 +2163,23 @@ def create_app(settings=None):
         )
         # Never hide an old unresolved task merely because newer resolved tasks exist.
         return [issue_row(session, issue) for issue in active + recent]
+
+    @app.post("/api/tasks/{issue_id}/custodian-resend")
+    def custodian_resend(issue_id: str, data: S.ReceiptFollowup,
+                         actor=Depends(user), session=Depends(db, scope="function")):
+        initial = get_issue(session, actor, issue_id)
+        issue = lock_missing(session, issue_id, initial.manager_id, data.revision)
+        mark_resend(session, issue, actor, data.reason)
+        return issue_row(session, issue)
+
+    @app.post("/api/tasks/{issue_id}/material-received")
+    def material_received(issue_id: str, data: S.MaterialReceived,
+                          actor=Depends(user), session=Depends(db, scope="function")):
+        initial = get_issue(session, actor, issue_id)
+        document = get_document(session, actor, data.document_id)
+        issue = lock_missing(session, issue_id, initial.manager_id, data.revision)
+        match_material(session, issue, document, actor, data.reason)
+        return issue_row(session, issue)
 
     @app.post("/api/tasks/{issue_id}/claim")
     def claim(
@@ -1285,6 +2529,295 @@ def create_app(settings=None):
                 .order_by(Mailbox.label)
             )
         ]
+
+    @app.get("/api/managers/{manager_id}/mail-items")
+    def mail_items(
+        manager_id: str,
+        mailbox_id: str | None = None,
+        paginated: bool = False,
+        offset: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=500),
+        q: str = Query("", max_length=500),
+        view: str = Query("all", pattern="^(all|action|completed|receipt|pending)$"),
+        actor=Depends(user), session=Depends(db, scope="function"),
+    ):
+        permissions = require(session, actor, manager_id, "archive")
+        query = select(MailItem).where(MailItem.manager_id == manager_id)
+        if not permissions["investor_read"]:
+            query = query.where(MailItem.category != "investor_redemption")
+        if mailbox_id:
+            box = session.get(Mailbox, mailbox_id)
+            if not box or box.manager_id != manager_id:
+                raise HTTPException(404, "邮箱不存在")
+            query = query.where(MailItem.document_id.in_(
+                select(MailReceipt.document_id).where(MailReceipt.mailbox_id == mailbox_id)
+            ))
+        if view in {"action", "completed"}:
+            query = query.where(MailItem.id.in_(select(MailAction.mail_item_id).where(
+                MailAction.status == ("open" if view == "action" else "completed")
+            )))
+        elif view == "receipt":
+            query = query.where(MailItem.handling_mode.in_(["receipt", "archive"]))
+        elif view == "pending":
+            query = query.where(MailItem.handling_mode == "pending")
+        if q.strip():
+            needle = q.strip()
+            query = query.where(or_(
+                MailItem.title.contains(needle, autoescape=True),
+                MailItem.sender.contains(needle, autoescape=True),
+                MailItem.id.in_(select(MailItemProduct.mail_item_id).join(
+                    Product, Product.id == MailItemProduct.product_id
+                ).where(Product.name.contains(needle, autoescape=True))),
+            ))
+        total = session.scalar(select(func.count()).select_from(query.subquery())) if paginated else 0
+        items = list(session.scalars(query.order_by(
+            MailItem.created_at.desc(), MailItem.id.desc()
+        ).offset(offset if paginated else 0).limit(limit if paginated else 500)))
+        page = {"total": total, "offset": offset, "limit": limit}
+        if not items:
+            return {**page, "items": []} if paginated else []
+        item_ids = [item.id for item in items]
+        document_ids = [item.document_id for item in items]
+        actions = {
+            action.mail_item_id: action
+            for action in session.scalars(
+                select(MailAction).where(MailAction.mail_item_id.in_(item_ids))
+            )
+        }
+        product_map = {item_id: [] for item_id in item_ids}
+        for item_id, product_id, name in session.execute(
+            select(MailItemProduct.mail_item_id, Product.id, Product.name)
+            .join(Product, MailItemProduct.product_id == Product.id)
+            .where(MailItemProduct.mail_item_id.in_(item_ids))
+            .order_by(Product.name)
+        ):
+            product_map[item_id].append({"id": product_id, "name": name})
+        source_map = {document_id: [] for document_id in document_ids}
+        for document_id, source_mailbox_id, label, username, folder in session.execute(
+            select(
+                MailReceipt.document_id,
+                Mailbox.id,
+                Mailbox.label,
+                Mailbox.username,
+                MailReceipt.folder,
+            )
+            .join(Mailbox, MailReceipt.mailbox_id == Mailbox.id)
+            .where(MailReceipt.document_id.in_(document_ids))
+            .order_by(Mailbox.label, MailReceipt.folder)
+        ):
+            source_map[document_id].append(
+                {"mailbox_id": source_mailbox_id, "mailbox": label, "username": username, "folder": folder}
+            )
+        attachment_counts = dict(
+            session.execute(
+                select(Document.parent_id, func.count(Document.id))
+                .where(Document.parent_id.in_(document_ids))
+                .group_by(Document.parent_id)
+            ).all()
+        )
+        result = []
+        for item in items:
+            result.append(
+                {
+                    **row(item),
+                    "action": row(actions.get(item.id)),
+                    "products": product_map[item.id],
+                    "sources": source_map[item.document_id],
+                    "attachment_count": attachment_counts.get(item.document_id, 0),
+                }
+            )
+        return {**page, "items": result} if paginated else result
+
+    @app.get("/api/mail-items/{item_id}")
+    def mail_item_detail(
+        item_id: str, actor=Depends(user), session=Depends(db, scope="function")
+    ):
+        item = session.get(MailItem, item_id)
+        if not item:
+            raise HTTPException(404, "邮件记录不存在")
+        require(session, actor, item.manager_id, "archive")
+        if item.category == "investor_redemption":
+            require(session, actor, item.manager_id, "investor_read")
+        original = get_document(session, actor, item.document_id)
+        path = settings.storage / original.storage_key
+        if not path.is_file():
+            raise HTTPException(503, "邮件原件暂不可用，请联系管理员")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != original.sha256:
+            raise HTTPException(503, "邮件原件完整性校验失败，已阻止展示")
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(raw)
+        except Exception as exc:
+            raise HTTPException(422, "邮件原件格式无法展开，请下载原件核对") from exc
+        attachments = list(
+            session.scalars(
+                select(Document)
+                .where(Document.parent_id == original.id)
+                .order_by(Document.received_at, Document.filename)
+            )
+        )
+        if not rights(session, actor, item.manager_id)["investor_read"]:
+            sensitive_document_ids = set(
+                session.scalars(
+                    select(DocumentMaterial.document_id).where(
+                        DocumentMaterial.document_id.in_(
+                            [attachment.id for attachment in attachments]
+                        ),
+                        DocumentMaterial.sensitivity == "investor_sensitive",
+                    )
+                )
+            )
+            attachments = [
+                attachment
+                for attachment in attachments
+                if attachment.id not in sensitive_document_ids
+            ]
+        sources = []
+        for label, username, folder in session.execute(
+            select(Mailbox.label, Mailbox.username, MailReceipt.folder)
+            .join(MailReceipt, MailReceipt.mailbox_id == Mailbox.id)
+            .where(MailReceipt.document_id == original.id)
+            .order_by(Mailbox.label, MailReceipt.folder)
+        ):
+            sources.append({"mailbox": label, "username": username, "folder": folder})
+        return {
+            "id": item.id,
+            "document_id": original.id,
+            "subject": str(message.get("Subject", "")).strip() or "（无主题邮件）",
+            "sender": str(message.get("From", "")).strip(),
+            "to": str(message.get("To", "")).strip(),
+            "cc": str(message.get("Cc", "")).strip(),
+            "sent_at": str(message.get("Date", "")).strip(),
+            "received_at": original.received_at,
+            "body": full_message_text(message),
+            "body_html": safe_message_html(message),
+            "category": item.category,
+            "business_date": item.business_date,
+            "sources": sources,
+            "attachments": [
+                {
+                    "id": attachment.id,
+                    "filename": attachment.filename,
+                    "size": attachment.size,
+                    "media_type": attachment.media_type,
+                    "sha256": attachment.sha256,
+                }
+                for attachment in attachments
+            ],
+        }
+
+    @app.get("/api/managers/{manager_id}/calendar")
+    def operations_calendar(
+        manager_id: str,
+        month: str,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        if not re.fullmatch(r"20\d{2}-(?:0[1-9]|1[0-2])", month):
+            raise HTTPException(422, "月份格式应为 YYYY-MM")
+        manager_permission(session, actor, manager_id)
+        year, month_number = (int(value) for value in month.split("-"))
+        dates = month_days(year, month_number)
+        return {
+            "month": month,
+            "calendar_version": VERSION,
+            "sources": {
+                "trading_days": SOURCES.get(year),
+                "public_holidays": PUBLIC_HOLIDAY_SOURCES.get(year),
+            },
+            "refresh": calendar_refresh_status(settings),
+            "days": [
+                {
+                    "date": day.isoformat(),
+                    "weekday": day.weekday(),
+                    "trading_day": is_trading_day(day),
+                    "holiday_name": public_holiday(day),
+                    "makeup_workday": is_makeup_workday(day),
+                }
+                for day in dates
+            ],
+        }
+
+    @app.post("/api/mail-actions/{action_id}/complete")
+    def complete_mail_action(
+        action_id: str,
+        data: S.MailActionCompletion,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        action = session.scalar(
+            select(MailAction)
+            .where(MailAction.id == action_id)
+            .with_for_update()
+        )
+        if not action:
+            raise HTTPException(404, "邮件待办不存在")
+        require(session, actor, action.manager_id, "write")
+        if action.revision != data.revision:
+            raise HTTPException(409, "待办已被其他人更新，请刷新后重试")
+        if action.status != "open":
+            raise HTTPException(409, "待办已经结束")
+        action.status = "completed"
+        action.result = {"reason": data.reason, "actor_id": actor.id, "at": now()}
+        action.updated_at = now()
+        action.revision += 1
+        item = session.get(MailItem, action.mail_item_id)
+        item.status = "completed"
+        item.updated_at = now()
+        item.revision += 1
+        audit(
+            session,
+            actor,
+            action.manager_id,
+            "mail_action.completed",
+            action.id,
+            {"mail_item_id": item.id, "reason": data.reason},
+        )
+        return {"ok": True, "revision": action.revision}
+
+    @app.put("/api/mail-items/{item_id}/classification")
+    def update_mail_classification(
+        item_id: str,
+        data: S.MailClassification,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        item = session.scalar(
+            select(MailItem).where(MailItem.id == item_id).with_for_update()
+        )
+        if not item:
+            raise HTTPException(404, "邮件记录不存在")
+        require(session, actor, item.manager_id, "write")
+        if item.revision != data.revision:
+            raise HTTPException(409, "邮件分类已被其他人更新，请刷新后重试")
+        before = {
+            "category": item.category,
+            "handling_mode": item.handling_mode,
+            "status": item.status,
+        }
+        apply_manual_classification(
+            session,
+            item,
+            data.category,
+            data.handling_mode,
+            data.suggested_action,
+        )
+        audit(
+            session,
+            actor,
+            item.manager_id,
+            "mail_item.classified",
+            item.id,
+            {
+                "before": before,
+                "after": {
+                    "category": item.category,
+                    "handling_mode": item.handling_mode,
+                    "status": item.status,
+                },
+            },
+        )
+        return {"ok": True, "revision": item.revision}
 
     def check_mailbox_connection(config):
         try:

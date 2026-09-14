@@ -293,10 +293,10 @@ def test_missing_receipt_and_parse_are_independent(env):
     p = product(client, ids["a"])
     with app.state.factory.begin() as db:
         refresh_missing(
-            db, ids["a"], at=datetime(2026, 8, 31, 13, tzinfo=ZoneInfo("Asia/Shanghai"))
+            db, ids["a"], at=datetime(2026, 8, 31, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
         )
         refresh_missing(
-            db, ids["a"], at=datetime(2026, 8, 31, 13, tzinfo=ZoneInfo("Asia/Shanghai"))
+            db, ids["a"], at=datetime(2026, 8, 31, 16, tzinfo=ZoneInfo("Asia/Shanghai"))
         )
     issues = client.get(f"/api/managers/{ids['a']}/tasks").json()
     assert len(issues) == 1 and issues[0]["valuation_date"] == "2026-08-28"
