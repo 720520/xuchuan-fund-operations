@@ -106,16 +106,20 @@ npm run dev
 
 ## 内网容器部署
 
-1. 将 `.env.example` 复制为 `.env`，填写至少 32 位的 URL 安全随机数据库口令和准确的应用访问来源。
-2. 生成 `MAIL_ENCRYPTION_KEY` 并写入 `.env`；这是网页邮箱授权码的独立加密密钥，必须另行备份。
-3. 运行以下命令构建并启动。Compose 会先执行迁移，再启动 API / worker。
+服务器安装 Docker Engine 与 Docker Compose v2 后，直接运行：
 
 ```bash
-docker compose up -d --build
-docker compose run --rm api python -m app.cli bootstrap --group '你的集团名称' --manager '你的管理人名称' --email 'your-admin@example.com' --name '管理员' --roles admin,operator --download
+./一键部署.sh
 ```
 
-默认网关仅绑定 `127.0.0.1:8080`。正式访问应通过内网 HTTPS 反向代理，不要将调试服务直接暴露公网。配置 `ALLOWED_ORIGINS=https://真实内网域名`、`COOKIE_SECURE=true`；只在本机 HTTP 验证时允许改为 `false`。
+首次部署会自动识别内网 IP、生成数据库口令与邮箱加密密钥、构建镜像、迁移数据库、启动服务并完成健康检查，随后在终端安全创建首个管理员。重复运行会保留账号、数据库和原件归档并部署当前代码。多网卡或 HTTPS 网关部署示例：
+
+```bash
+./一键部署.sh --bind 192.168.10.20 --port 8080
+./一键部署.sh --bind 127.0.0.1 --origin https://fundops.intra.example
+```
+
+HTTP 只用于受控内网试运行。处理真实投资者资料和邮箱授权码时，应通过公司的内网 HTTPS 网关访问，并使用准确的 `--origin`。完整配置、数据位置和运维命令见[内网一键部署说明](deploy/README.md)。需要人工配置时仍可复制 `.env.example` 为 `.env`。
 
 数据库和归档文件分别使用持久卷。不要执行 `docker compose down -v`，它会删除卷。上线前必须配置双份备份、加密、恢复演练、容量监控及主机权限。
 
