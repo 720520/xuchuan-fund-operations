@@ -490,6 +490,7 @@ function Workspace({
     [revision, setRevision] = useState(0),
     [mobile, setMobile] = useState(false),
     [modal, setModal] = useState<Modal | null>(null),
+    [mailTarget, setMailTarget] = useState<{ itemId: string; request: number } | null>(null),
     [feedback, setFeedback] = useState(""),
     [search, setSearch] = useState(""),
     [materialSection, setMaterialSection] = useState<"relations" | "documents" | "pending">("relations"),
@@ -611,6 +612,7 @@ function Workspace({
   const refresh = () => setRevision((v) => v + 1);
   const done = () => {
     setModal(null);
+    setMailTarget(null);
     setFeedback("已保存，业务数据已更新。");
     refresh();
   };
@@ -656,8 +658,17 @@ function Workspace({
   }
   function go(v: string) {
     setView(v);
+    if (v !== "mail") setMailTarget(null);
     setMobile(false);
     setSearch("");
+  }
+  function openOriginalMail(itemId: string) {
+    setModal(null);
+    setMailTarget((current) => ({
+      itemId,
+      request: (current?.request || 0) + 1,
+    }));
+    go("mail");
   }
   const visibleNav = navigation
     .filter((n) => !["mail", "upload"].includes(n.id) || perm?.archive)
@@ -2009,6 +2020,7 @@ function Workspace({
                   {view === "mail" && base && (
                     <MailWorkspace key={managerId} base={base} boxes={boxes} boxesError={boxesState.error}
                       revision={revision} canWrite={Boolean(perm?.write)}
+                      target={mailTarget}
                       renderDetail={(item) => <MailDetailView key={item.id} item={item} canDownload={Boolean(perm?.download)} />}
                       onAction={(item) => setModal({ kind: "mail-action", item })}
                       onClassify={(item) => setModal({ kind: "mail-classify", item })} />
@@ -2525,13 +2537,22 @@ function Workspace({
                                 </TableCell>
                                 <TableCell>{timestamp(t.created_at)}</TableCell>
                                 <TableCell>
-                                  <Button
-                                    variant="ghost"
-                                    onClick={() => setModal({ kind: "task", task: t })}
-                                  >
-                                    查看与处理
-                                    <ChevronRight size={13} />
-                                  </Button>
+                                  <div className="row-actions">
+                                    {t.mail_item_id && perm?.archive &&
+                                      (t.mail_item_category !== "investor_redemption" || perm.investor_read) && (
+                                        <Button variant="ghost" onClick={() => openOriginalMail(t.mail_item_id!)}>
+                                          <Mail size={13} />
+                                          原始邮件
+                                        </Button>
+                                      )}
+                                    <Button
+                                      variant="ghost"
+                                      onClick={() => setModal({ kind: "task", task: t })}
+                                    >
+                                      查看与处理
+                                      <ChevronRight size={13} />
+                                    </Button>
+                                  </div>
                                 </TableCell>
                               </TableRow>
                             ))}
@@ -3100,6 +3121,7 @@ function Workspace({
               done={done}
               onComplete={(task) => setModal({ kind: "nav", task })}
               onUpload={() => setModal({ kind: "upload" })}
+              onOpenMail={openOriginalMail}
             />
           )}
         </DialogContent>
@@ -3114,6 +3136,7 @@ function TaskDetail({
   done,
   onComplete,
   onUpload,
+  onOpenMail,
   documents,
 }: {
   documents: Doc[];
@@ -3122,6 +3145,7 @@ function TaskDetail({
   done: () => void;
   onComplete: (t: Task) => void;
   onUpload: () => void;
+  onOpenMail: (itemId: string) => void;
 }) {
   const [error, setError] = useState(""),
     [selected, setSelected] = useState(""),
@@ -3145,6 +3169,13 @@ function TaskDetail({
         </p>
       ))}
       {task.payload.error && <p className="parse-error">{task.payload.error}</p>}
+      {task.mail_item_id && manager.permissions.archive &&
+        (task.mail_item_category !== "investor_redemption" || manager.permissions.investor_read) && (
+          <Button variant="outline" onClick={() => onOpenMail(task.mail_item_id!)}>
+            <Mail />
+            查看原始邮件
+          </Button>
+        )}
       {task.payload.document_id && manager.permissions.download && (
         <a className="text-link" href={`/api/documents/${task.payload.document_id}/download`}>
           下载原始材料核对

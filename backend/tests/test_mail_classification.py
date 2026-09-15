@@ -7,7 +7,7 @@ from app.mail_sync import ingest_message
 from app.mailbox_security import selectable_folders
 from app.models import Document, MailAction, MailItem, Mailbox, Membership, ParseJob, User
 from app.security import password_hash
-from app.services import archive
+from app.services import archive, task
 from conftest import PASSWORD, login
 
 
@@ -137,6 +137,48 @@ def test_mail_detail_returns_complete_safe_body_headers_and_attachments(env):
     client.cookies.clear()
     login(client, "fund")
     assert client.get(f"/api/mail-items/{item_id}").status_code == 403
+
+
+def test_exception_links_attachment_back_to_original_mail(env):
+    app, client, ids = env
+    with app.state.factory.begin() as db:
+        box = mailbox(db, ids["a"])
+        original_id = ingest_message(
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "exception-source",
+            message("需人工核查的业务材料", attachment="核查材料.pdf").as_bytes(),
+        )
+        mail_item = db.scalar(
+            select(MailItem).where(MailItem.document_id == original_id)
+        )
+        attachment_id = db.scalar(
+            select(Document.id).where(Document.parent_id == original_id)
+        )
+        issue = task(
+            db,
+            ids["a"],
+            "parse",
+            "parse:mail-link-test",
+            {"document_id": attachment_id, "errors": [{"reason": "需要人工核查"}]},
+        )
+        issue_id = issue.id
+        mail_item_id = mail_item.id
+
+    login(client)
+    tasks = client.get(f"/api/managers/{ids['a']}/tasks").json()
+    linked = next(item for item in tasks if item["id"] == issue_id)
+    assert linked["mail_item_id"] == mail_item_id
+    assert linked["mail_item_category"] == "unknown"
+
+    exact = client.get(
+        f"/api/managers/{ids['a']}/mail-items",
+        params={"paginated": True, "item_id": mail_item_id},
+    ).json()
+    assert exact["total"] == 1
+    assert exact["items"][0]["id"] == mail_item_id
 
 
 def test_investor_mail_original_and_attachments_require_investor_permission(env):

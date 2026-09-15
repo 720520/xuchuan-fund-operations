@@ -278,6 +278,8 @@ export type Investor = {
 };
 export type Task = {
   id: string;
+  mail_item_id: string | null;
+  mail_item_category: string | null;
   kind: string;
   status: string;
   revision: number;

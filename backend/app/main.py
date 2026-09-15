@@ -499,9 +499,8 @@ def create_app(settings=None):
         item["assignee_name"] = (
             session.get(User, issue.assignee_id).name if issue.assignee_id else None
         )
-        item["candidates"] = [
-            row(r)
-            for r in session.scalars(
+        candidates = list(
+            session.scalars(
                 select(NavRecord)
                 .where(
                     NavRecord.manager_id == issue.manager_id,
@@ -509,7 +508,37 @@ def create_app(settings=None):
                 )
                 .order_by(NavRecord.received_at)
             )
-        ]
+        )
+        item["candidates"] = [row(candidate) for candidate in candidates]
+
+        document_ids = [issue.payload.get("document_id")]
+        document_ids.extend(candidate.document_id for candidate in candidates)
+        if issue.payload.get("expectation_id"):
+            expectation = session.get(
+                ReceiptExpectation, issue.payload["expectation_id"]
+            )
+            if expectation and expectation.manager_id == issue.manager_id:
+                document_ids.append(expectation.document_id)
+
+        mail_item = None
+        visited = set()
+        for document_id in filter(None, document_ids):
+            document = session.get(Document, document_id)
+            while document and document.id not in visited:
+                visited.add(document.id)
+                mail_item = session.scalar(
+                    select(MailItem).where(
+                        MailItem.manager_id == issue.manager_id,
+                        MailItem.document_id == document.id,
+                    )
+                )
+                if mail_item or not document.parent_id:
+                    break
+                document = session.get(Document, document.parent_id)
+            if mail_item:
+                break
+        item["mail_item_id"] = mail_item.id if mail_item else None
+        item["mail_item_category"] = mail_item.category if mail_item else None
         return item
 
     def nav_from_input(
@@ -2679,6 +2708,7 @@ def create_app(settings=None):
     @app.get("/api/managers/{manager_id}/mail-items")
     def mail_items(
         manager_id: str,
+        item_id: str | None = None,
         mailbox_id: str | None = None,
         paginated: bool = False,
         offset: int = Query(0, ge=0),
@@ -2689,6 +2719,8 @@ def create_app(settings=None):
     ):
         permissions = require(session, actor, manager_id, "archive")
         query = select(MailItem).where(MailItem.manager_id == manager_id)
+        if item_id:
+            query = query.where(MailItem.id == item_id)
         if not permissions["investor_read"]:
             query = query.where(MailItem.category != "investor_redemption")
         if mailbox_id:
