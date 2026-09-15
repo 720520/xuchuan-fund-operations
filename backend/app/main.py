@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import (
@@ -41,6 +42,7 @@ from .mailbox_security import (
     stored_config,
     test_connection,
 )
+from .nav_export import build_nav_export
 from .models import (
     AuditEvent,
     Document,
@@ -1073,6 +1075,110 @@ def create_app(settings=None):
     ):
         require(session, actor, manager_id, "write")
         return row(nav_from_input(session, actor, manager_id, data))
+
+    @app.get("/api/managers/{manager_id}/nav/export")
+    def export_nav(
+        manager_id: str,
+        start_date: date = Query(...),
+        end_date: date = Query(...),
+        product_ids: list[str] | None = Query(None, alias="product_id"),
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        if start_date > end_date:
+            raise HTTPException(422, "开始日期不能晚于结束日期")
+        permissions = manager_permission(session, actor, manager_id)
+        if not permissions["download"]:
+            raise HTTPException(403, "没有导出净值的下载权限")
+
+        requested = set(product_ids or [])
+        accessible_products = list(session.scalars(product_query(session, actor, manager_id)))
+        accessible_ids = {product.id for product in accessible_products}
+        if requested and not requested.issubset(accessible_ids):
+            raise HTTPException(403, "选择的产品中包含无权查看的产品")
+        selected_ids = requested or accessible_ids
+
+        records = []
+        if selected_ids:
+            result = session.execute(
+                select(NavRecord, EffectiveNav, Product, ShareClass)
+                .join(
+                    EffectiveNav,
+                    EffectiveNav.record_id == NavRecord.id,
+                )
+                .join(Product, Product.id == NavRecord.product_id)
+                .join(ShareClass, ShareClass.id == NavRecord.share_id)
+                .where(
+                    NavRecord.manager_id == manager_id,
+                    NavRecord.product_id.in_(selected_ids),
+                    NavRecord.valuation_date >= start_date.isoformat(),
+                    NavRecord.valuation_date <= end_date.isoformat(),
+                )
+                .order_by(
+                    NavRecord.valuation_date,
+                    Product.code,
+                    Product.name,
+                    ShareClass.name,
+                )
+                .limit(50_001)
+            ).all()
+            if len(result) > 50_000:
+                raise HTTPException(422, "导出记录超过 50000 条，请缩小日期范围或选择单个产品")
+            records = [
+                {
+                    "valuation_date": nav.valuation_date,
+                    "product_code": product.code,
+                    "product_name": product.name,
+                    "share_name": share.name,
+                    "currency": product.currency,
+                    "unit_nav": nav.unit_nav,
+                    "accumulated_nav": nav.accumulated_nav,
+                    "net_assets": nav.net_assets,
+                    "total_shares": nav.total_shares,
+                    "source": nav.source,
+                    "reversal": effective.reversal,
+                    "received_at": nav.received_at,
+                    "record_id": nav.id,
+                    "document_id": nav.document_id,
+                    "revision": effective.revision,
+                }
+                for nav, effective, product, share in result
+            ]
+
+        manager = session.get(Manager, manager_id)
+        generated_at = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        content = build_nav_export(
+            manager_name=manager.name,
+            start_date=start_date,
+            end_date=end_date,
+            records=records,
+            generated_at=generated_at,
+        )
+        audit(
+            session,
+            actor,
+            manager_id,
+            "nav.exported",
+            manager_id,
+            {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "product_ids": sorted(requested),
+                "scope": "selected" if requested else "all_accessible",
+                "row_count": len(records),
+            },
+        )
+        filename = f"产品净值_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx"
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename=nav_export.xlsx; "
+                    f"filename*=UTF-8''{quote(filename)}"
+                )
+            },
+        )
 
     @app.get("/api/products/{product_id}/nav")
     def nav_history(
@@ -2136,16 +2242,56 @@ def create_app(settings=None):
         ):
             raise HTTPException(409, "待确认产品已经变化，请重新解析后核对")
         product = build_product(session, doc.manager_id, data)
-        job.status, job.updated_at = "queued", now()
+        timestamp = now()
+
+        def matches_confirmed_product(candidate):
+            candidate_code = str(candidate.get("product_code") or "").strip()
+            candidate_name = str(candidate.get("product_name") or "").strip()
+            return candidate_code == data.code or (
+                not candidate_code and candidate_name == data.name
+            )
+
+        # One confirmation is enough for every historical attachment that yielded
+        # the same exact product candidate. The raw parse result remains available
+        # until the worker replaces it with the successful reparse result.
+        requeued_document_ids = []
+        pending_jobs = list(
+            session.scalars(
+                select(ParseJob)
+                .where(
+                    ParseJob.manager_id == doc.manager_id,
+                    ParseJob.status == "review",
+                )
+                .with_for_update()
+            )
+        )
+        for pending_job in pending_jobs:
+            errors = (pending_job.result or {}).get("errors", [])
+            if any(
+                matches_confirmed_product(error.get("candidate", {}))
+                for error in errors
+                if error.get("candidate")
+            ):
+                pending_job.status = "queued"
+                pending_job.updated_at = timestamp
+                requeued_document_ids.append(pending_job.document_id)
         audit(
             session,
             actor,
             doc.manager_id,
             "product.confirmed_from_document",
             product.id,
-            {"document_id": doc.id, **data.model_dump()},
+            {
+                "document_id": doc.id,
+                "historical_documents_requeued": len(requeued_document_ids),
+                **data.model_dump(),
+            },
         )
-        return {"id": product.id, "parse_status": "queued"}
+        return {
+            "id": product.id,
+            "parse_status": "queued",
+            "requeued_documents": len(requeued_document_ids),
+        }
 
     @app.get("/api/managers/{manager_id}/tasks")
     def tasks(

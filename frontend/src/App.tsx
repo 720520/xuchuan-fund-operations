@@ -92,6 +92,7 @@ import {
   LifecycleForm,
   MaterialForm,
   MemberForm,
+  NavExportForm,
   NavForm,
   ProductForm,
   ScheduleForm,
@@ -207,6 +208,7 @@ type Modal =
   | { kind: "product"; candidate?: Candidate; documentId?: string }
   | { kind: "filing" }
   | { kind: "nav"; task?: Task }
+  | { kind: "nav-export"; productId?: string }
   | { kind: "upload"; productId?: string; investorId?: string }
   | { kind: "material"; document: Doc }
   | { kind: "investor"; investor?: Investor }
@@ -663,21 +665,53 @@ function Workspace({
     .filter((n) => n.id !== "settings" || perm?.admin)
     .filter((n) => n.id !== "audit" || perm?.archive || perm?.admin);
   const pending = tasks.filter((t) => t.status !== "resolved");
-  const pendingProducts = Array.from(
-    new Map(
-      docs.flatMap((document) =>
-        (document.job?.result.errors || [])
-          .filter((error) => error.candidate)
-          .map((error) => {
-            const candidate = error.candidate!;
-            return [
-              `${document.id}:${candidate.product_code || candidate.product_name || "unknown"}`,
-              { document, candidate },
-            ] as const;
-          }),
-      ),
-    ).values(),
-  );
+  const pendingProductGroups = new Map<
+    string,
+    {
+      document: Doc;
+      candidate: Candidate;
+      documentIds: Set<string>;
+      names: Set<string>;
+      shares: Set<string>;
+    }
+  >();
+  docs.forEach((document) => {
+    (document.job?.result.errors || []).forEach((error) => {
+      if (!error.candidate) return;
+      const candidate = error.candidate;
+      const code = candidate.product_code?.trim() || "";
+      const name = candidate.product_name?.trim() || "";
+      const key = code
+        ? `code:${code}`
+        : name
+          ? `name:${name}`
+          : `unknown:${document.id}`;
+      const group = pendingProductGroups.get(key) || {
+        document,
+        candidate,
+        documentIds: new Set<string>(),
+        names: new Set<string>(),
+        shares: new Set<string>(),
+      };
+      group.documentIds.add(document.id);
+      if (name) group.names.add(name);
+      (candidate.share_class || "")
+        .split(/[，,、/]/)
+        .map((share) => share.trim())
+        .filter(Boolean)
+        .forEach((share) => group.shares.add(share));
+      pendingProductGroups.set(key, group);
+    });
+  });
+  const pendingProducts = Array.from(pendingProductGroups.values()).map((group) => ({
+    document: group.document,
+    sourceCount: group.documentIds.size,
+    nameVariants: Array.from(group.names),
+    candidate: {
+      ...group.candidate,
+      share_class: Array.from(group.shares).join(",") || group.candidate.share_class,
+    },
+  }));
   const productNames = new Map(products.map((product) => [product.id, product.name]));
   const materialDocuments = docs.filter((document) => !document.filename.toLowerCase().endsWith(".eml"));
   const unorganizedMaterials = materialDocuments.filter((document) => document.material_status !== "organized");
@@ -1406,16 +1440,20 @@ function Workspace({
                           </TableRow>
                         </TableHeader>
                         <TableBody>
-                          {pendingProducts.map(({ document, candidate }) => (
+                          {pendingProducts.map(({ document, candidate, sourceCount, nameVariants }) => (
                             <TableRow key={`${document.id}:${candidate.product_code || candidate.product_name}`}>
                               <TableCell>
                                 <strong>{candidate.product_name || "名称待核对"}</strong>
                                 <small className="block-sub">{candidate.product_code || "代码待核对"}</small>
+                                {nameVariants.length > 1 && (
+                                  <small className="parse-error">名称存在 {nameVariants.length} 种写法，请核对</small>
+                                )}
                               </TableCell>
                               <TableCell>{candidate.share_class || "待核对"}</TableCell>
                               <TableCell>
                                 {sourceLabel(document.source)}
                                 <small className="block-sub">{document.filename}</small>
+                                {sourceCount > 1 && <small className="block-sub">共 {sourceCount} 份历史材料</small>}
                               </TableCell>
                               <TableCell>
                                 {perm?.write && (
@@ -1659,6 +1697,16 @@ function Workspace({
                     title="净值与估值"
                     text="以有效版本呈现历史，所有原始版本保持不变。"
                   >
+                    {perm?.download && (
+                      <Button
+                        variant="outline"
+                        onClick={() => setModal({ kind: "nav-export", productId: p?.id })}
+                        disabled={!products.length}
+                      >
+                        <Download />
+                        导出 Excel
+                      </Button>
+                    )}
                     {perm?.write && (
                       <Button onClick={() => setModal({ kind: "nav" })} disabled={!products.length}>
                         <Plus />
@@ -2746,6 +2794,7 @@ function Workspace({
                   product: "产品建档",
                   filing: "新建产品备案",
                   nav: modal?.kind === "nav" && modal.task ? "人工补齐材料" : "人工补录净值",
+                  "nav-export": "导出产品净值",
                   upload: modal?.kind === "upload" && modal.productId
                     ? "上传到产品"
                     : modal?.kind === "upload" && modal.investorId
@@ -2791,6 +2840,18 @@ function Workspace({
           )}
           {modal?.kind === "nav" && (
             <NavForm managerId={managerId} products={products} task={modal.task} suggestedDate={suggestedDate} done={done} />
+          )}
+          {modal?.kind === "nav-export" && (
+            <NavExportForm
+              managerId={managerId}
+              products={products}
+              initialProductId={modal.productId}
+              suggestedDate={share?.latest?.valuation_date || suggestedDate}
+              done={() => {
+                setModal(null);
+                setFeedback("Excel 已生成并开始下载。");
+              }}
+            />
           )}
           {modal?.kind === "upload" && (
             <UploadForm

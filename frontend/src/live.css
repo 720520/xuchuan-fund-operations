@@ -992,6 +992,29 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.nav-export-selection-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.nav-export-selection-head .row-actions {
+  flex-shrink: 0;
+  gap: 2px;
+}
+.nav-export-selection-head button {
+  min-height: 26px;
+  padding: 3px 8px;
+}
+.nav-export-product-list {
+  max-height: 220px;
+}
+.nav-export-product-list input {
+  accent-color: #a9654c;
+}
 .investor-center-panel [data-slot="table"] {
   width: 100%;
   table-layout: fixed;

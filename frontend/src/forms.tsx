@@ -4,6 +4,7 @@ import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import {
   api,
+  downloadFile,
   post,
   put,
   previousFriday,
@@ -321,6 +322,101 @@ export function NavForm({
           </label>
         </>
       )}
+    </ActionForm>
+  );
+}
+
+export function NavExportForm({
+  managerId,
+  products,
+  initialProductId,
+  suggestedDate,
+  done,
+}: {
+  managerId: string;
+  products: Product[];
+  initialProductId?: string;
+  suggestedDate?: string;
+  done: () => void;
+}) {
+  const defaultDate = suggestedDate || previousFriday();
+  const [selectedProductIds, setSelectedProductIds] = useState<Set<string>>(
+    () =>
+      new Set(
+        initialProductId && products.some((product) => product.id === initialProductId)
+          ? [initialProductId]
+          : products.map((product) => product.id),
+      ),
+  );
+  return (
+    <ActionForm
+      done={done}
+      disabled={!products.length || !selectedProductIds.size}
+      label="下载 Excel"
+      submit={(form) => {
+        const startDate = val(form, "start_date");
+        const endDate = val(form, "end_date");
+        const params = new URLSearchParams({
+          start_date: startDate,
+          end_date: endDate,
+        });
+        products.forEach((product) => {
+          if (selectedProductIds.has(product.id)) params.append("product_id", product.id);
+        });
+        return downloadFile(
+          `/managers/${managerId}/nav/export?${params.toString()}`,
+          `产品净值_${startDate.replaceAll("-", "")}_${endDate.replaceAll("-", "")}.xlsx`,
+        );
+      }}
+    >
+      <p className="inline-note">
+        导出选定估值日范围内的当前有效版本，并保留来源记录和原件编号便于追溯。
+      </p>
+      <div className="field-pair">
+        <Field label="开始估值日">
+          <Input name="start_date" type="date" required defaultValue={defaultDate} />
+        </Field>
+        <Field label="结束估值日">
+          <Input name="end_date" type="date" required defaultValue={defaultDate} />
+        </Field>
+      </div>
+      <Field
+        label={`产品范围（已选 ${selectedProductIds.size} / ${products.length} 个）`}
+        hint="所选产品的净值会按估值日汇总在同一个工作表中"
+      >
+        <div className="nav-export-selection-head">
+          <span>只显示当前账号有权查看的产品</span>
+          <div className="row-actions">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setSelectedProductIds(new Set(products.map((product) => product.id)))}
+            >
+              全选
+            </Button>
+            <Button type="button" variant="ghost" onClick={() => setSelectedProductIds(new Set())}>
+              清空
+            </Button>
+          </div>
+        </div>
+        <div className="material-product-list nav-export-product-list">
+          {products.map((product) => (
+            <label key={product.id} title={`${product.code} · ${product.name}`}>
+              <input
+                type="checkbox"
+                checked={selectedProductIds.has(product.id)}
+                onChange={(event) => {
+                  const next = new Set(selectedProductIds);
+                  if (event.target.checked) next.add(product.id);
+                  else next.delete(product.id);
+                  setSelectedProductIds(next);
+                }}
+              />
+              <span>{product.code} · {product.name}</span>
+            </label>
+          ))}
+        </div>
+      </Field>
     </ActionForm>
   );
 }

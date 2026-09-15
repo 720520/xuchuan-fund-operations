@@ -191,8 +191,34 @@ def test_unknown_product_can_be_created_then_reparsed(env):
         f"/api/managers/{ids['a']}/documents", files={"file": ("new.csv", content)}
     )
     assert response.status_code == 201
+    historical = client.post(
+        f"/api/managers/{ids['a']}/documents",
+        files={
+            "file": (
+                "historical.csv",
+                "产品代码,产品名称,份额类别,估值日期,单位净值\nF001,未知新产品,A,2026-08-29,1.06\n".encode(),
+            )
+        },
+    )
+    assert historical.status_code == 201
+    unrelated = client.post(
+        f"/api/managers/{ids['a']}/documents",
+        files={
+            "file": (
+                "other.csv",
+                "产品代码,产品名称,份额类别,估值日期,单位净值\nF002,另一未知产品,A,2026-08-29,1.01\n".encode(),
+            )
+        },
+    )
+    assert unrelated.status_code == 201
     run_once(app.state.factory, app.state.settings)
-    issue = client.get(f"/api/managers/{ids['a']}/tasks").json()[0]
+    issues = client.get(f"/api/managers/{ids['a']}/tasks").json()
+    assert len(issues) == 3
+    issue = next(
+        issue
+        for issue in issues
+        if issue["payload"]["errors"][0]["candidate"]["product_code"] == "F001"
+    )
     assert issue["payload"]["errors"][0]["candidate"]["product_code"] == "F001"
     assert client.get(f"/api/managers/{ids['a']}/products").json() == []
     confirmed = client.post(
@@ -200,11 +226,45 @@ def test_unknown_product_can_be_created_then_reparsed(env):
         json={"code": "F001", "name": "未知新产品", "shares": ["A"]},
     )
     assert confirmed.status_code == 201, confirmed.text
+    assert confirmed.json()["requeued_documents"] == 2
+    with app.state.factory() as db:
+        statuses = {
+            document_id: status
+            for document_id, status in db.execute(
+                select(ParseJob.document_id, ParseJob.status).where(
+                    ParseJob.document_id.in_(
+                        [
+                            response.json()["id"],
+                            historical.json()["id"],
+                            unrelated.json()["id"],
+                        ]
+                    )
+                )
+            )
+        }
+        assert statuses[response.json()["id"]] == "queued"
+        assert statuses[historical.json()["id"]] == "queued"
+        assert statuses[unrelated.json()["id"]] == "review"
     run_once(app.state.factory, app.state.settings)
     assert len(client.get(f"/api/managers/{ids['a']}/products").json()) == 1
-    assert (
-        client.get(f"/api/managers/{ids['a']}/tasks").json()[0]["status"] == "resolved"
-    )
+    with app.state.factory() as db:
+        statuses = {
+            document_id: status
+            for document_id, status in db.execute(
+                select(ParseJob.document_id, ParseJob.status).where(
+                    ParseJob.document_id.in_(
+                        [
+                            response.json()["id"],
+                            historical.json()["id"],
+                            unrelated.json()["id"],
+                        ]
+                    )
+                )
+            )
+        }
+        assert statuses[response.json()["id"]] == "completed"
+        assert statuses[historical.json()["id"]] == "completed"
+        assert statuses[unrelated.json()["id"]] == "review"
 
 
 def test_product_filing_completes_into_product(env):

@@ -37,6 +37,40 @@ export const post = <T = unknown>(path: string, body?: unknown) =>
 export const put = <T = unknown>(path: string, body: unknown) =>
   api<T>(path, { method: "PUT", body: JSON.stringify(body) });
 
+export async function downloadFile(path: string, fallbackName: string) {
+  const response = await fetch("/api" + path, { credentials: "same-origin" });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: "响应内容不可读" }));
+    if (response.status === 401) window.dispatchEvent(new Event("session-expired"));
+    const detail = Array.isArray(body.detail)
+      ? body.detail
+          .map((item: { msg?: string; loc?: string[] }) =>
+            `${item.loc?.slice(1).join(".") || "参数"}: ${item.msg || "无效"}`,
+          )
+          .join("；")
+      : body.detail;
+    throw new ApiError(detail || `下载失败 (${response.status})`, response.status);
+  }
+  const disposition = response.headers.get("content-disposition") || "";
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  let filename = fallbackName;
+  if (encoded) {
+    try {
+      filename = decodeURIComponent(encoded);
+    } catch {
+      filename = fallbackName;
+    }
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export function useResource<T>(path: string | null, revision: number) {
   const [state, setState] = useState<{
     path: string | null;
