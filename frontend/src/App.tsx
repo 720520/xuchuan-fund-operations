@@ -852,6 +852,13 @@ function Workspace({
     [view, setView] = useState("overview"),
     [revision, setRevision] = useState(0),
     [mobile, setMobile] = useState(false),
+    [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+      try {
+        return window.localStorage.getItem("xuchuan.sidebar.collapsed") === "true";
+      } catch {
+        return false;
+      }
+    }),
     [modal, setModal] = useState<Modal | null>(null),
     [mailTarget, setMailTarget] = useState<{ itemId: string; request: number } | null>(null),
     [feedback, setFeedback] = useState(""),
@@ -876,6 +883,15 @@ function Workspace({
   const manager = me.managers.find((m) => m.id === managerId),
     perm = manager?.permissions;
   const base = manager ? `/managers/${manager.id}` : null;
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("xuchuan.sidebar.collapsed", String(sidebarCollapsed));
+    } catch {
+      // The layout still works when browser storage is unavailable.
+    }
+  }, [sidebarCollapsed]);
+
   const materialPageSize = 50;
   const productsState = useResource<Product[]>(
     base && (perm?.read || perm?.admin)
@@ -1427,7 +1443,13 @@ function Workspace({
     }));
 
   return (
-    <div className={"app-shell " + (mobile ? "menu-open" : "")}>
+    <div
+      className={
+        "app-shell " +
+        (mobile ? "menu-open " : "") +
+        (sidebarCollapsed ? "sidebar-collapsed" : "")
+      }
+    >
       {mobile && (
         <button
           className="mobile-backdrop"
@@ -1444,7 +1466,7 @@ function Workspace({
             序川<small className="brand-sub">FUND OPERATIONS</small>
           </span>
         </div>
-        <div className="workspace">
+        <div className="workspace" title={manager?.name || "当前管理人"}>
           <span className="workspace-icon">
             <Building2 size={16} />
           </span>
@@ -1470,6 +1492,7 @@ function Workspace({
               key={n.id}
               className={"nav-link " + (view === n.id ? "active" : "")}
               aria-label={n.label}
+              title={sidebarCollapsed ? n.label : undefined}
               onClick={() => {
                 if (n.id === "upload") {
                   setMaterialSection(perm?.investor_read ? "relations" : "documents");
@@ -1489,7 +1512,7 @@ function Workspace({
               aria-current={view === n.id ? "page" : undefined}
             >
               <n.icon size={17} />
-              {n.label}
+              <span className="nav-link-label">{n.label}</span>
               {n.id === "exceptions" && pending.length > 0 && (
                 <span className="nav-count">{pending.length}</span>
               )}
@@ -1497,9 +1520,9 @@ function Workspace({
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <div className="sync-note">
+          <div className="sync-note" title="业务数据每 15 秒刷新">
             <i />
-            业务数据每 15 秒刷新
+            <span className="sync-note-label">业务数据每 15 秒刷新</span>
           </div>
           <div className="user">
             <span className="avatar">{me.name.slice(0, 1)}</span>
@@ -1530,6 +1553,16 @@ function Workspace({
           </div>
         </div>
       </aside>
+      <button
+        type="button"
+        className="sidebar-toggle"
+        aria-label={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        aria-expanded={!sidebarCollapsed}
+        title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+      >
+        {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+      </button>
       <div className="main-shell">
         <header className="topbar">
           <div className="breadcrumb">

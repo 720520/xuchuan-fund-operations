@@ -34,6 +34,10 @@
   --radius: 0.75rem;
   color-scheme: light;
 }
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 * {
   box-sizing: border-box;
   border-color: var(--border);
@@ -43,7 +47,8 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  font-size: 13px;
+  font-size: 14px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
 button,
@@ -92,7 +97,7 @@ strong {
   font-weight: 550;
 }
 small {
-  font-size: 11px;
+  font-size: 13px;
 }
 .app-shell {
   min-height: 100vh;
@@ -131,7 +136,7 @@ small {
 .brand-sub {
   display: block;
   font-family: system-ui, sans-serif;
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 400;
   letter-spacing: 2px;
   margin-top: 2px;
@@ -156,18 +161,18 @@ small {
   font-size: 13px;
 }
 .workspace strong {
-  font-size: 12px;
+  font-size: 14px;
   display: block;
 }
 .workspace small {
-  font-size: 9px;
+  font-size: 12px;
   color: #89897c;
 }
 .workspace button {
   margin-left: auto;
 }
 .nav-label {
-  font-size: 10px;
+  font-size: 13px;
   color: #919186;
   letter-spacing: 1.2px;
   margin: 8px 15px 12px;
@@ -204,7 +209,7 @@ small {
   margin-left: auto;
   color: #8f5c45;
   background: #e4d8c8;
-  font-size: 10px;
+  font-size: 13px;
   border-radius: 4px;
   min-width: 19px;
   text-align: center;
@@ -215,7 +220,7 @@ small {
   padding-top: 40px;
 }
 .gallery-link {
-  font-size: 11px;
+  font-size: 13px;
   display: flex;
   align-items: center;
   gap: 9px;
@@ -223,7 +228,7 @@ small {
   color: #78786d;
 }
 .sync-note {
-  font-size: 9px;
+  font-size: 12px;
   color: #929183;
   padding: 14px 13px;
   display: flex;
@@ -253,12 +258,12 @@ small {
   color: #626556;
 }
 .user strong {
-  font-size: 12px;
+  font-size: 14px;
 }
 .user small {
   display: block;
   color: #87877b;
-  font-size: 9px;
+  font-size: 12px;
   margin-top: 3px;
 }
 .user > svg {
@@ -286,7 +291,7 @@ small {
   display: flex;
   align-items: center;
   gap: 12px;
-  font-size: 11px;
+  font-size: 13px;
 }
 .breadcrumb {
   color: #939389;
@@ -297,10 +302,10 @@ small {
 }
 .top-actions select {
   border: none;
-  font-size: 11px;
+  font-size: 13px;
 }
 .preview-tag {
-  font-size: 10px;
+  font-size: 13px;
   border: 1px solid #dedace;
   border-radius: 5px;
   padding: 3px 7px;
@@ -320,7 +325,7 @@ small {
   margin-bottom: 32px;
 }
 .eyebrow {
-  font-size: 9px;
+  font-size: 12px;
   letter-spacing: 1.8px;
   color: #95958a;
   margin-bottom: 10px;
@@ -333,7 +338,7 @@ small {
   line-height: 1.4;
 }
 .page-heading p {
-  font-size: 11px;
+  font-size: 13px;
   color: #909084;
   margin-top: 9px;
 }
@@ -341,7 +346,7 @@ small {
   height: 38px !important;
   padding: 0 16px !important;
   border-radius: 8px !important;
-  font-size: 12px !important;
+  font-size: 14px !important;
 }
 .metrics {
   display: grid;
@@ -356,7 +361,7 @@ small {
   padding-left: 25px;
 }
 .metrics > div > span {
-  font-size: 11px;
+  font-size: 13px;
   color: #787b70;
 }
 .metrics strong {
@@ -371,12 +376,12 @@ small {
 }
 .metrics strong small {
   font-family: system-ui, sans-serif;
-  font-size: 11px;
+  font-size: 13px;
   color: #828577;
   margin-left: 3px;
 }
 .metrics p {
-  font-size: 9px;
+  font-size: 12px;
   color: #929386;
   display: flex;
   align-items: center;
@@ -406,7 +411,7 @@ small {
   gap: 12px;
 }
 .panel-header p {
-  font-size: 10px;
+  font-size: 13px;
   color: #909186;
   margin-top: 6px;
 }
@@ -421,7 +426,7 @@ small {
 .segmented button {
   border: 0;
   background: none;
-  font-size: 10px;
+  font-size: 13px;
   padding: 6px 9px;
   color: #8c8b80;
   border-radius: 5px;
@@ -451,15 +456,15 @@ small {
   color: #a56b5c !important;
 }
 .chart-summary .positive {
-  font-size: 12px;
+  font-size: 14px;
 }
 .chart-summary small {
-  font-size: 9px;
+  font-size: 12px;
   color: #909487;
   margin-left: 4px;
 }
 .chart-legend {
-  font-size: 9px;
+  font-size: 12px;
   color: #898b80;
   display: flex;
   align-items: center;
@@ -489,7 +494,7 @@ small {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 9px;
+  font-size: 12px;
   color: #a0a094;
 }
 .chart-caption button {
@@ -502,7 +507,7 @@ small {
 }
 .subtle {
   color: #8b8e81;
-  font-size: 11px;
+  font-size: 13px;
 }
 .progress-panel {
   padding-bottom: 18px;
@@ -531,7 +536,7 @@ small {
   background: #edf1e7;
   border-radius: 5px;
   padding: 4px 7px;
-  font-size: 9px;
+  font-size: 12px;
   white-space: nowrap;
 }
 .status i {
@@ -567,7 +572,7 @@ small {
 }
 .progress-copy {
   padding: 12px 24px;
-  font-size: 10px;
+  font-size: 13px;
 }
 .progress-row {
   display: flex;
@@ -575,7 +580,7 @@ small {
   justify-content: space-between;
   margin: 0 24px;
   padding: 8px 0;
-  font-size: 11px;
+  font-size: 13px;
 }
 .progress-row > span {
   display: flex;
@@ -606,7 +611,7 @@ small {
   width: calc(100% - 48px);
   margin: 13px 24px 0;
   height: 33px !important;
-  font-size: 11px !important;
+  font-size: 13px !important;
   justify-content: space-between !important;
 }
 .mini-note {
@@ -614,7 +619,7 @@ small {
   justify-content: center;
   align-items: center;
   gap: 6px;
-  font-size: 9px;
+  font-size: 12px;
   color: #969a8c;
   margin-top: 12px;
 }
@@ -622,13 +627,13 @@ small {
   padding-bottom: 17px;
 }
 .products-panel .panel-header button {
-  font-size: 11px;
+  font-size: 13px;
   color: #858779;
 }
 .data-table th {
   background: #f8f7f2;
   color: #969587;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 400;
   height: 37px;
   padding: 0 20px;
@@ -636,7 +641,7 @@ small {
 .data-table td {
   height: 72px;
   padding: 12px 20px;
-  font-size: 11px;
+  font-size: 13px;
 }
 .data-table td.number {
   font-variant-numeric: tabular-nums;
@@ -665,12 +670,12 @@ small {
 }
 .product-name strong {
   display: block;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
 }
 .product-name small {
   display: block;
-  font-size: 9px;
+  font-size: 12px;
   color: #96978b;
   margin-top: 5px;
 }
@@ -683,7 +688,7 @@ small {
   align-items: center;
   margin-top: 22px;
   color: #a0a092;
-  font-size: 9px;
+  font-size: 12px;
 }
 .page-footer > span:first-child {
   display: flex;
@@ -709,7 +714,7 @@ small {
   padding: 12px 35px;
   background: #f3ead9;
   color: #8d713e;
-  font-size: 11px;
+  font-size: 13px;
   display: flex;
   gap: 9px;
   align-items: center;
@@ -728,7 +733,7 @@ small {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
+  font-size: 14px;
   z-index: 100;
   animation: enter 0.2s ease-out;
   max-width: 90vw;
@@ -883,7 +888,7 @@ small {
     font-size: 24px;
   }
   .page-heading p {
-    font-size: 10px;
+    font-size: 13px;
     max-width: 230px;
   }
   .primary-action {
@@ -891,20 +896,20 @@ small {
     height: 40px !important;
   }
   .eyebrow {
-    font-size: 8px;
+    font-size: 12px;
     letter-spacing: 1px;
   }
   .metrics strong {
     font-size: 30px;
   }
   .metrics p {
-    font-size: 9px;
+    font-size: 12px;
   }
   .chart-summary {
     padding-left: 18px;
   }
   .chart-summary .positive {
-    font-size: 10px;
+    font-size: 13px;
   }
   .chart-panel .panel-header {
     flex-direction: column;
