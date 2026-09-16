@@ -190,6 +190,7 @@ export type Doc = {
   notes?: string;
   sensitivity?: "standard" | "investor_sensitive";
   material_status?: "pending" | "organized";
+  organization_source?: "manual" | "system_parse" | null;
   material_revision?: number;
   organized_at?: string | null;
   organized_by?: string | null;
@@ -276,6 +277,77 @@ export type Investor = {
   suitability_source_document_id?: string | null;
   bank_accounts?: InvestorBankAccount[];
 };
+export type InvestorShareEvent = {
+  id: string;
+  investor_id: string;
+  product_id: string;
+  product_name: string;
+  share_id: string | null;
+  share_name: string | null;
+  event_type: "subscription" | "additional_subscription" | "redemption" | "full_redemption" | "cash_dividend" | "dividend_reinvestment" | "transfer" | "adjustment";
+  evidence_stage: "notice" | "application" | "accepted" | "confirmation";
+  status: "pending" | "confirmed" | "archived" | "void";
+  application_date: string | null;
+  confirmation_date: string | null;
+  effective_date: string | null;
+  requested_amount: string | null;
+  confirmed_amount: string | null;
+  units_delta: string | null;
+  unit_nav: string | null;
+  fee_amount: string | null;
+  balance_after: string | null;
+  business_ref: string | null;
+  source_mail_item_id: string | null;
+  source_mail_title: string | null;
+  source_document_id: string | null;
+  source_document_name: string | null;
+  supersedes_event_id: string | null;
+  notes: string;
+  revision: number;
+  created_at: string;
+  confirmed_at: string | null;
+};
+export type InvestorShareLedger = {
+  events: InvestorShareEvent[];
+  positions: {
+    product_id: string;
+    product_name: string;
+    share_id: string | null;
+    share_name: string | null;
+    confirmed_units: string | null;
+    latest_snapshot_units: string | null;
+    snapshot_as_of_date: string | null;
+    difference: string | null;
+    current_units: string | null;
+    current_as_of_date: string | null;
+    current_source: "snapshot" | "event_balance" | "event_delta";
+  }[];
+  snapshots: {
+    id: string;
+    product_id: string;
+    product_name: string;
+    share_id: string | null;
+    share_name: string | null;
+    as_of_date: string;
+    units: string;
+    source_mail_item_id: string | null;
+    source_document_id: string | null;
+    notes: string;
+  }[];
+};
+export type ProductInvestorShareLedger = {
+  product: { id: string; name: string; code: string };
+  investors: {
+    investor: {
+      id: string;
+      display_name: string;
+      investor_type: Investor["investor_type"];
+      suitability_class: Investor["suitability_class"];
+      status: Investor["status"];
+    };
+    ledger: InvestorShareLedger;
+  }[];
+};
 export type Task = {
   id: string;
   mail_item_id: string | null;
@@ -290,6 +362,11 @@ export type Task = {
   share_id: string | null;
   valuation_date: string | null;
   created_at: string;
+  investor_name?: string | null;
+  investor_share_event?: InvestorShareEvent | null;
+  investor_position_snapshot?: (InvestorShareLedger["snapshots"][number] & {
+    investor_id: string;
+  }) | null;
   payload: {
     expectation_id?: string;
     due_date?: string;
@@ -301,6 +378,16 @@ export type Task = {
     document_id?: string;
     errors?: { reason?: string; message?: string; candidate?: Candidate }[];
     error?: string;
+    share_event_id?: string;
+    snapshot_id?: string;
+    investor_id?: string;
+    source_mail_item_id?: string | null;
+    reason?: string;
+    message?: string;
+    missing_units?: boolean;
+    missing_mail?: boolean;
+    difference?: string;
+    as_of_date?: string;
   };
   candidates: Nav[];
   resolution: unknown;
@@ -346,11 +433,13 @@ export type MailItem = {
   handling_mode: "task" | "receipt" | "pending" | "archive";
   priority: "high" | "normal" | "low";
   confidence: number;
+  classification_source: string;
   status: "pending" | "received" | "completed";
   revision: number;
   excerpt: string;
   created_at: string;
   attachment_count: number;
+  receipt_count: number;
   products: { id: string; name: string }[];
   sources: { mailbox: string; username: string; folder: string }[];
   action: null | {
@@ -416,6 +505,7 @@ export const taskLabel = (s: string) =>
     validation: "校验异常",
     missing: "材料未到",
     mailbox: "邮箱连接异常",
+    investor_share: "投资者份额异常",
   })[s] || s;
 export const stageLabel = (s: string) =>
   ({

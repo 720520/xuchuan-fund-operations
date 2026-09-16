@@ -8,11 +8,14 @@ import {
   post,
   put,
   previousFriday,
+  useResource,
   lifecycleLabel,
   type Candidate,
   type Doc,
   type Investor,
   type InvestorBankAccount,
+  type MailDetail,
+  type MailItem,
   type Member,
   type Product,
   type Task,
@@ -624,6 +627,9 @@ export function MaterialForm({
             <option value="supplemental_agreement">补充协议</option>
             <option value="subscription_form">认申购申请</option>
             <option value="redemption_form">赎回申请</option>
+            <option value="share_confirmation">份额确认单</option>
+            <option value="position_statement">投资者持仓表</option>
+            <option value="dividend_notice">分红确认／通知</option>
             <option value="double_recording">双录资料</option>
             <option value="cooling_off_callback">冷静期回访</option>
             <option value="transfer_voucher">划款凭证</option>
@@ -926,6 +932,177 @@ export function InvestorBankAccountForm({
       <Field label="适用产品" hint="不选择表示该账户暂未限定产品">
         <div className="material-product-list">{products.map((product) => <label key={product.id}><input type="checkbox" name="product_ids" value={product.id} defaultChecked={linked.has(product.id)} /><span>{product.name}</span></label>)}</div>
       </Field>
+    </ActionForm>
+  );
+}
+
+export function InvestorShareEventForm({
+  investor,
+  investors,
+  products,
+  sourceMail,
+  done,
+}: {
+  investor?: Investor;
+  investors: Investor[];
+  products: Product[];
+  sourceMail?: MailItem;
+  done: () => void;
+}) {
+  const initialInvestorId = investor?.id || "";
+  const initialProductId = sourceMail?.products[0]?.id || investor?.product_ids[0] || "";
+  const [productId, setProductId] = useState(initialProductId);
+  const [stage, setStage] = useState("notice");
+  const mailState = useResource<MailDetail>(sourceMail ? `/mail-items/${sourceMail.id}` : null, sourceMail?.revision || 0);
+  const product = products.find((entry) => entry.id === productId);
+  const nullable = (form: FormData, name: string) => val(form, name) || null;
+  return (
+    <ActionForm
+      done={done}
+      label={stage === "confirmation" && sourceMail ? "按邮件数据保存并入账" : "保存份额信息"}
+      submit={(form) => post(`/investors/${val(form, "investor_id")}/share-events`, {
+        product_id: val(form, "product_id"),
+        share_id: nullable(form, "share_id"),
+        event_type: val(form, "event_type"),
+        evidence_stage: val(form, "evidence_stage"),
+        application_date: nullable(form, "application_date"),
+        confirmation_date: nullable(form, "confirmation_date"),
+        effective_date: nullable(form, "effective_date"),
+        requested_amount: nullable(form, "requested_amount"),
+        confirmed_amount: nullable(form, "confirmed_amount"),
+        units_delta: nullable(form, "units_delta"),
+        unit_nav: nullable(form, "unit_nav"),
+        fee_amount: nullable(form, "fee_amount"),
+        balance_after: nullable(form, "balance_after"),
+        business_ref: nullable(form, "business_ref"),
+        source_mail_item_id: sourceMail?.id || null,
+        source_document_id: nullable(form, "source_document_id"),
+        supersedes_event_id: null,
+        notes: val(form, "notes"),
+      })}
+    >
+      {sourceMail && <p className="inline-note"><strong>来源邮件：</strong>{sourceMail.title}<br />邮件和附件只作为来源依据，不会被移动、删除或改变状态。</p>}
+      <div className="field-pair">
+        <Field label="投资者">
+          <select name="investor_id" required defaultValue={initialInvestorId}>
+            <option value="" disabled>请选择投资者</option>
+            {investors.map((entry) => <option key={entry.id} value={entry.id}>{entry.display_name}</option>)}
+          </select>
+        </Field>
+        <Field label="产品">
+          <select name="product_id" required value={productId} onChange={(event) => setProductId(event.target.value)}>
+            <option value="" disabled>请选择产品</option>
+            {products.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}
+          </select>
+        </Field>
+      </div>
+      <div className="field-pair">
+        <Field label="份额类别">
+          <select name="share_id" defaultValue="">
+            <option value="">未细分／邮件未提供</option>
+            {(product?.shares || []).map((share) => <option key={share.id} value={share.id}>{share.name}</option>)}
+          </select>
+        </Field>
+        <Field label="业务类型">
+          <select name="event_type" required defaultValue="subscription">
+            <option value="subscription">申购</option>
+            <option value="additional_subscription">追加申购</option>
+            <option value="redemption">赎回</option>
+            <option value="full_redemption">全部赎回</option>
+            <option value="cash_dividend">现金分红</option>
+            <option value="dividend_reinvestment">红利再投资</option>
+            <option value="transfer">份额转让</option>
+            <option value="adjustment">其他调整</option>
+          </select>
+        </Field>
+      </div>
+      <Field label="材料阶段" hint="正式确认邮件字段完整时自动计入持仓；其他阶段只作留痕。">
+        <select name="evidence_stage" value={stage} onChange={(event) => setStage(event.target.value)}>
+          <option value="notice">仅通知</option>
+          <option value="application">申请材料</option>
+          <option value="accepted">托管已受理</option>
+          <option value="confirmation">正式确认</option>
+        </select>
+      </Field>
+      <div className="field-pair">
+        <Field label="申请日"><Input name="application_date" type="date" /></Field>
+        <Field label="确认日"><Input name="confirmation_date" type="date" required={stage === "confirmation"} /></Field>
+      </div>
+      <div className="field-pair">
+        <Field label="生效日"><Input name="effective_date" type="date" /></Field>
+        <Field label="业务编号"><Input name="business_ref" maxLength={150} /></Field>
+      </div>
+      <h3 className="form-section-title">邮件中的数值</h3>
+      <div className="field-pair">
+        <Field label="申请金额"><Input name="requested_amount" inputMode="decimal" /></Field>
+        <Field label="确认金额"><Input name="confirmed_amount" inputMode="decimal" /></Field>
+      </div>
+      <div className="field-pair">
+        <Field label="份额变动" hint="赎回填写负数"><Input name="units_delta" inputMode="decimal" /></Field>
+        <Field label="确认后份额"><Input name="balance_after" inputMode="decimal" /></Field>
+      </div>
+      <div className="field-pair">
+        <Field label="确认净值"><Input name="unit_nav" inputMode="decimal" /></Field>
+        <Field label="手续费"><Input name="fee_amount" inputMode="decimal" /></Field>
+      </div>
+      {sourceMail && (
+        <Field label="确认依据附件" hint="可留空；原始邮件仍会自动关联。">
+          <select name="source_document_id" defaultValue="">
+            <option value="">仅关联邮件原件</option>
+            {(mailState.data?.attachments || []).map((attachment) => <option key={attachment.id} value={attachment.id}>{attachment.filename}</option>)}
+          </select>
+        </Field>
+      )}
+      <Field label="整理说明"><textarea name="notes" maxLength={2000} rows={3} /></Field>
+      <p className="inline-note">系统以来源邮件为依据。只有缺少邮件、日期或关键份额字段时才进入异常中心；通知、申请和受理材料不会改变当前份额。</p>
+    </ActionForm>
+  );
+}
+
+export function InvestorPositionSnapshotForm({
+  investor,
+  investors,
+  products,
+  sourceMail,
+  done,
+}: {
+  investor?: Investor;
+  investors: Investor[];
+  products: Product[];
+  sourceMail?: MailItem;
+  done: () => void;
+}) {
+  const initialProductId = sourceMail?.products[0]?.id || investor?.product_ids[0] || "";
+  const [productId, setProductId] = useState(initialProductId);
+  const mailState = useResource<MailDetail>(sourceMail ? `/mail-items/${sourceMail.id}` : null, sourceMail?.revision || 0);
+  const product = products.find((entry) => entry.id === productId);
+  return (
+    <ActionForm
+      done={done}
+      label="保存持仓快照"
+      submit={(form) => post(`/investors/${val(form, "investor_id")}/position-snapshots`, {
+        product_id: val(form, "product_id"),
+        share_id: val(form, "share_id") || null,
+        as_of_date: val(form, "as_of_date"),
+        units: val(form, "units"),
+        source_mail_item_id: sourceMail?.id || null,
+        source_document_id: val(form, "source_document_id") || null,
+        notes: val(form, "notes"),
+      })}
+    >
+      {sourceMail && <p className="inline-note"><strong>来源邮件：</strong>{sourceMail.title}</p>}
+      <div className="field-pair">
+        <Field label="投资者"><select name="investor_id" required defaultValue={investor?.id || ""}><option value="" disabled>请选择投资者</option>{investors.map((entry) => <option key={entry.id} value={entry.id}>{entry.display_name}</option>)}</select></Field>
+        <Field label="产品"><select name="product_id" required value={productId} onChange={(event) => setProductId(event.target.value)}><option value="" disabled>请选择产品</option>{products.map((entry) => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select></Field>
+      </div>
+      <Field label="份额类别"><select name="share_id" defaultValue=""><option value="">未细分</option>{(product?.shares || []).map((share) => <option key={share.id} value={share.id}>{share.name}</option>)}</select></Field>
+      <div className="field-pair">
+        <Field label="快照日期"><Input name="as_of_date" type="date" required /></Field>
+        <Field label="托管确认份额"><Input name="units" inputMode="decimal" required /></Field>
+      </div>
+      {sourceMail && <Field label="持仓依据附件"><select name="source_document_id" defaultValue=""><option value="">仅关联邮件原件</option>{(mailState.data?.attachments || []).map((attachment) => <option key={attachment.id} value={attachment.id}>{attachment.filename}</option>)}</select></Field>}
+      <Field label="核对说明"><textarea name="notes" maxLength={2000} rows={3} /></Field>
+      <p className="inline-note">快照不会覆盖份额流水；系统会显示快照与已确认流水之间的差异。</p>
     </ActionForm>
   );
 }

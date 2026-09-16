@@ -36,6 +36,8 @@ def test_initial_migration_and_append_only_guards(tmp_path, monkeypatch):
         "investor_products",
         "investor_bank_accounts",
         "investor_bank_account_products",
+        "investor_share_events",
+        "investor_position_snapshots",
     } <= set(tables)
     with engine.connect() as c:
         triggers = (
@@ -68,10 +70,14 @@ def test_initial_migration_and_append_only_guards(tmp_path, monkeypatch):
         "lifecycle_updated_at",
         "lifecycle_updated_by",
     } <= {column["name"] for column in inspect(engine).get_columns("products")}
-    assert {"sensitivity", "material_type"} <= {
+    material_columns = inspect(engine).get_columns("document_materials")
+    assert {"sensitivity", "material_type", "organization_source"} <= {
         column["name"]
-        for column in inspect(engine).get_columns("document_materials")
+        for column in material_columns
     }
+    assert next(
+        column for column in material_columns if column["name"] == "confirmed_by"
+    )["nullable"]
     assert {
         "suitability_class",
         "certificate_number_ciphertext",
@@ -110,6 +116,8 @@ def test_postgresql_migration_reaches_material_organization(monkeypatch):
                 "investor_products",
                 "investor_bank_accounts",
                 "investor_bank_account_products",
+                "investor_share_events",
+                "investor_position_snapshots",
             } <= tables
         finally:
             engine.dispose()

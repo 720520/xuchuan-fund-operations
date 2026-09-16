@@ -174,7 +174,8 @@ class DocumentMaterial(Base):
     notes = Column(Text, default="", nullable=False)
     sensitivity = Column(String(30), default="standard", nullable=False)
     status = Column(String(20), default="organized", nullable=False)
-    confirmed_by = Column(ForeignKey("users.id"), nullable=False)
+    organization_source = Column(String(30), default="manual", nullable=False)
+    confirmed_by = Column(ForeignKey("users.id"), nullable=True)
     confirmed_at = Column(String(40), default=now, nullable=False)
     created_at = Column(String(40), default=now, nullable=False)
     updated_at = Column(String(40), default=now, nullable=False)
@@ -258,6 +259,110 @@ class InvestorProduct(Base):
             ["product_id", "manager_id"], ["products.id", "products.manager_id"]
         ),
         UniqueConstraint("investor_id", "product_id"),
+    )
+
+
+class InvestorShareEvent(Base):
+    __tablename__ = "investor_share_events"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False, index=True)
+    investor_id = Column(String(36), nullable=False, index=True)
+    product_id = Column(String(36), nullable=False, index=True)
+    share_id = Column(String(36), nullable=True)
+    event_type = Column(String(30), nullable=False)
+    evidence_stage = Column(String(20), default="notice", nullable=False)
+    status = Column(String(20), default="pending", nullable=False, index=True)
+    application_date = Column(String(10), nullable=True)
+    confirmation_date = Column(String(10), nullable=True)
+    effective_date = Column(String(10), nullable=True)
+    requested_amount = Column(Numeric(24, 6), nullable=True)
+    confirmed_amount = Column(Numeric(24, 6), nullable=True)
+    units_delta = Column(Numeric(24, 6), nullable=True)
+    unit_nav = Column(Numeric(18, 8), nullable=True)
+    fee_amount = Column(Numeric(24, 6), nullable=True)
+    balance_after = Column(Numeric(24, 6), nullable=True)
+    business_ref = Column(String(150), nullable=True)
+    source_mail_item_id = Column(String(36), nullable=True)
+    source_document_id = Column(String(36), nullable=True)
+    supersedes_event_id = Column(String(36), nullable=True)
+    notes = Column(Text, default="", nullable=False)
+    created_by = Column(ForeignKey("users.id"), nullable=False)
+    confirmed_by = Column(ForeignKey("users.id"), nullable=True)
+    created_at = Column(String(40), default=now, nullable=False)
+    updated_at = Column(String(40), default=now, nullable=False)
+    confirmed_at = Column(String(40), nullable=True)
+    revision = Column(Integer, default=1, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("id", "manager_id"),
+        ForeignKeyConstraint(
+            ["investor_id", "manager_id"], ["investors.id", "investors.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["share_id", "manager_id", "product_id"],
+            ["share_classes.id", "share_classes.manager_id", "share_classes.product_id"],
+        ),
+        ForeignKeyConstraint(
+            ["source_mail_item_id", "manager_id"],
+            ["mail_items.id", "mail_items.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["source_document_id", "manager_id"],
+            ["documents.id", "documents.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["supersedes_event_id", "manager_id"],
+            ["investor_share_events.id", "investor_share_events.manager_id"],
+        ),
+        Index(
+            "ix_investor_share_event_timeline",
+            "manager_id",
+            "investor_id",
+            "product_id",
+            "effective_date",
+        ),
+    )
+
+
+class InvestorPositionSnapshot(Base):
+    __tablename__ = "investor_position_snapshots"
+    id = Column(String(36), primary_key=True, default=uid)
+    manager_id = Column(String(36), nullable=False, index=True)
+    investor_id = Column(String(36), nullable=False, index=True)
+    product_id = Column(String(36), nullable=False, index=True)
+    share_id = Column(String(36), nullable=True)
+    as_of_date = Column(String(10), nullable=False)
+    units = Column(Numeric(24, 6), nullable=False)
+    source_mail_item_id = Column(String(36), nullable=True)
+    source_document_id = Column(String(36), nullable=True)
+    notes = Column(Text, default="", nullable=False)
+    created_by = Column(ForeignKey("users.id"), nullable=False)
+    created_at = Column(String(40), default=now, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("id", "manager_id"),
+        ForeignKeyConstraint(
+            ["investor_id", "manager_id"], ["investors.id", "investors.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["product_id", "manager_id"], ["products.id", "products.manager_id"]
+        ),
+        ForeignKeyConstraint(
+            ["share_id", "manager_id", "product_id"],
+            ["share_classes.id", "share_classes.manager_id", "share_classes.product_id"],
+        ),
+        ForeignKeyConstraint(
+            ["source_mail_item_id", "manager_id"],
+            ["mail_items.id", "mail_items.manager_id"],
+        ),
+        ForeignKeyConstraint(
+            ["source_document_id", "manager_id"],
+            ["documents.id", "documents.manager_id"],
+        ),
+        UniqueConstraint(
+            "investor_id", "product_id", "share_id", "as_of_date", "source_document_id"
+        ),
     )
 
 

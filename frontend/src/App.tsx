@@ -73,6 +73,9 @@ import {
   type History,
   type Investor,
   type InvestorBankAccount,
+  type InvestorShareEvent,
+  type InvestorShareLedger,
+  type ProductInvestorShareLedger,
   type MailDetail,
   type MailItem,
   type Mailbox,
@@ -89,6 +92,8 @@ import {
   Field,
   InvestorForm,
   InvestorBankAccountForm,
+  InvestorPositionSnapshotForm,
+  InvestorShareEventForm,
   LifecycleForm,
   MaterialForm,
   MemberForm,
@@ -213,10 +218,14 @@ type Modal =
   | { kind: "material"; document: Doc }
   | { kind: "investor"; investor?: Investor }
   | { kind: "bank-account"; investor: Investor; account?: InvestorBankAccount }
+  | { kind: "share-event"; investor?: Investor; sourceMail?: MailItem }
+  | { kind: "position-snapshot"; investor?: Investor; sourceMail?: MailItem }
+  | { kind: "share-event-status"; event: InvestorShareEvent; status: "confirmed" | "archived" | "void" }
   | { kind: "schedule"; product: Product }
   | { kind: "lifecycle"; product: Product }
   | { kind: "member"; member?: Member }
   | { kind: "task"; task: Task }
+  | { kind: "task-mail-disposition"; task: Task; disposition: "notification" | "duplicate" | "void" }
   | { kind: "mailbox"; mailbox?: Mailbox }
   | { kind: "mail-action"; item: MailItem }
   | { kind: "mail-classify"; item: MailItem }
@@ -225,6 +234,360 @@ type Modal =
   | { kind: "share"; product: Product }
   | { kind: "password" }
   | { kind: "rules" };
+
+type ShareWorkspaceTab = "positions" | "events" | "snapshots" | "sources";
+type ShareInvestorSummary = ProductInvestorShareLedger["investors"][number]["investor"];
+type ProductInvestorLedger = ProductInvestorShareLedger["investors"][number];
+type ShareWorkspaceHolding = {
+  key: string;
+  title: string;
+  subtitle: string;
+  productId: string;
+  position: InvestorShareLedger["positions"][number];
+  ledger: InvestorShareLedger;
+  investor?: ShareInvestorSummary;
+  latestEvent?: InvestorShareEvent;
+  latestSnapshot?: InvestorShareLedger["snapshots"][number];
+};
+
+const shareEventLabels: Record<InvestorShareEvent["event_type"], string> = {
+  subscription: "申购",
+  additional_subscription: "追加申购",
+  redemption: "赎回",
+  full_redemption: "全部赎回",
+  cash_dividend: "现金分红",
+  dividend_reinvestment: "红利再投资",
+  transfer: "份额转让",
+  adjustment: "份额调整",
+};
+
+const shareEventStatusLabels: Record<InvestorShareEvent["status"], string> = {
+  pending: "待处理",
+  confirmed: "已同步",
+  archived: "仅归档",
+  void: "已作废",
+};
+
+function shareEventDate(event?: InvestorShareEvent) {
+  return event?.effective_date || event?.confirmation_date || event?.application_date || "";
+}
+
+function sameShare(
+  shareId: string | null,
+  candidate: { share_id: string | null },
+) {
+  return candidate.share_id === shareId;
+}
+
+function holdingCurrentUnits(holding: ShareWorkspaceHolding) {
+  if (holding.position.current_units !== null) return holding.position.current_units;
+  const snapshotDate = holding.position.snapshot_as_of_date || "";
+  const eventDate = shareEventDate(holding.latestEvent);
+  if (holding.position.latest_snapshot_units !== null && snapshotDate >= eventDate) {
+    return holding.position.latest_snapshot_units;
+  }
+  return holding.latestEvent?.balance_after ?? holding.position.confirmed_units ?? holding.position.latest_snapshot_units;
+}
+
+function holdingHasDifference(holding: ShareWorkspaceHolding) {
+  return Boolean(
+    holding.position.difference &&
+    Number(holding.position.difference) !== 0,
+  );
+}
+
+function holdingDataDate(holding: ShareWorkspaceHolding) {
+  if (holding.position.current_as_of_date) return holding.position.current_as_of_date;
+  const snapshotDate = holding.position.snapshot_as_of_date || "";
+  const eventDate = shareEventDate(holding.latestEvent);
+  return snapshotDate >= eventDate ? snapshotDate : eventDate;
+}
+
+function InvestorShareWorkspace({
+  revision,
+  investors,
+  products,
+  canDownload,
+  onOpenMail,
+}: {
+  revision: number;
+  investors: Investor[];
+  products: Product[];
+  canDownload: boolean;
+  onOpenMail: (id: string) => void;
+}) {
+  const [perspective, setPerspective] = useState<"investor" | "product">("investor");
+  const [entityId, setEntityId] = useState("");
+  const [holdingKey, setHoldingKey] = useState("");
+  const [query, setQuery] = useState("");
+  const [tab, setTab] = useState<ShareWorkspaceTab>("positions");
+  const entities = perspective === "investor" ? investors : products;
+  const selectedEntity = entities.find((entry) => entry.id === entityId) || entities[0];
+  const selectedInvestor = perspective === "investor" ? selectedEntity as Investor | undefined : undefined;
+  const selectedProduct = perspective === "product" ? selectedEntity as Product | undefined : undefined;
+  const investorLedgerState = useResource<InvestorShareLedger>(
+    selectedInvestor ? `/investors/${selectedInvestor.id}/share-events` : null,
+    revision,
+  );
+  const productLedgerState = useResource<ProductInvestorShareLedger>(
+    perspective === "product" && selectedProduct
+      ? `/products/${selectedProduct.id}/investor-shares`
+      : null,
+    revision,
+  );
+  const productLedgers: ProductInvestorLedger[] = productLedgerState.data?.investors || [];
+
+  const filteredEntities = entities.filter((entry) => {
+    const haystack = perspective === "investor"
+      ? `${(entry as Investor).display_name} ${investorTypeLabels[(entry as Investor).investor_type]}`
+      : `${(entry as Product).name} ${(entry as Product).code}`;
+    return haystack.toLowerCase().includes(query.trim().toLowerCase());
+  });
+  const activeLedger = investorLedgerState.data;
+  const holdings: ShareWorkspaceHolding[] = perspective === "investor"
+    ? (activeLedger?.positions || []).map((position) => {
+        const latestEvent = activeLedger?.events.find(
+          (event) => event.status !== "void" && event.product_id === position.product_id && sameShare(position.share_id, event),
+        );
+        const latestSnapshot = activeLedger?.snapshots.find(
+          (snapshot) => snapshot.product_id === position.product_id && sameShare(position.share_id, snapshot),
+        );
+        return {
+          key: `${position.product_id}:${position.share_id || "all"}`,
+          title: position.product_name,
+          subtitle: position.share_name || "总份额",
+          productId: position.product_id,
+          position,
+          ledger: activeLedger!,
+          latestEvent,
+          latestSnapshot,
+        };
+      })
+    : productLedgers.flatMap(({ investor, ledger }) =>
+        ledger.positions.map((position) => ({
+          key: `${investor.id}:${position.product_id}:${position.share_id || "all"}`,
+          title: investor.display_name,
+          subtitle: `${investorTypeLabels[investor.investor_type]} · ${position.share_name || "总份额"}`,
+          productId: position.product_id,
+          position,
+          ledger,
+          investor,
+          latestEvent: ledger.events.find(
+            (event) => event.status !== "void" && event.product_id === position.product_id && sameShare(position.share_id, event),
+          ),
+          latestSnapshot: ledger.snapshots.find(
+            (snapshot) => snapshot.product_id === position.product_id && sameShare(position.share_id, snapshot),
+          ),
+        })),
+      );
+  const activeHolding = holdings.find((holding) => holding.key === holdingKey) || holdings[0];
+  const activeHoldingKey = activeHolding?.key || "";
+  const allEvents = perspective === "investor"
+    ? (activeLedger?.events || []).map((event) => ({ event, investor: selectedInvestor }))
+    : productLedgers.flatMap(({ investor, ledger }) => ledger.events.map((event) => ({ event, investor })));
+  const allSnapshots = perspective === "investor"
+    ? activeLedger?.snapshots || []
+    : productLedgers.flatMap(({ ledger }) => ledger.snapshots);
+  const sourceMailCount = new Set([
+    ...allEvents.map(({ event }) => event.source_mail_item_id),
+    ...allSnapshots.map((snapshot) => snapshot.source_mail_item_id),
+  ].filter(Boolean)).size;
+  const attentionCount = holdings.filter((holding) =>
+    holdingHasDifference(holding) ||
+    holding.latestEvent?.status === "pending",
+  ).length;
+  const loading = perspective === "investor" ? investorLedgerState.loading : productLedgerState.loading;
+  const error = perspective === "investor" ? investorLedgerState.error : productLedgerState.error;
+
+  function selectPerspective(next: "investor" | "product") {
+    setPerspective(next);
+    setEntityId("");
+    setHoldingKey("");
+    setQuery("");
+    setTab("positions");
+  }
+
+  function renderSourceAction(event?: InvestorShareEvent, snapshot?: InvestorShareLedger["snapshots"][number]) {
+    const mailId = event?.source_mail_item_id || snapshot?.source_mail_item_id;
+    const documentId = event?.source_document_id || snapshot?.source_document_id;
+    if (mailId) return <button className="text-link button-link" onClick={() => onOpenMail(mailId)}>查看原始邮件</button>;
+    if (documentId && canDownload) return <a className="text-link" href={`/api/documents/${documentId}/download`}>下载来源附件</a>;
+    return <span className="muted">来源已留痕</span>;
+  }
+
+  return (
+    <section className="share-workspace panel">
+      <div className="share-workspace-toolbar">
+        <div className="material-direction" aria-label="份额查看方向">
+          <button className={perspective === "investor" ? "current" : ""} onClick={() => selectPerspective("investor")}>按投资者</button>
+          <button className={perspective === "product" ? "current" : ""} onClick={() => selectPerspective("product")}>按产品</button>
+        </div>
+        <div className="search-inline share-entity-search">
+          <Search size={15} />
+          <Input
+            aria-label={perspective === "investor" ? "搜索投资者" : "搜索产品"}
+            placeholder={perspective === "investor" ? "搜索投资者名称或类型" : "搜索产品名称或代码"}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </div>
+        <span className="share-auto-note"><i />邮件自动入账 · 仅异常需要处理</span>
+      </div>
+      <div className="share-workspace-grid">
+        <aside className="share-entity-panel">
+          <div className="material-entity-heading">
+            <strong>{perspective === "investor" ? "投资者" : "产品"}</strong>
+            <span>{filteredEntities.length} 个主体</span>
+          </div>
+          <div className="share-entity-list">
+            {filteredEntities.map((entry) => {
+              const investor = perspective === "investor" ? entry as Investor : undefined;
+              const product = perspective === "product" ? entry as Product : undefined;
+              const selected = entry.id === selectedEntity?.id;
+              return (
+                <button key={entry.id} className={selected ? "current" : ""} onClick={() => {
+                  setEntityId(entry.id);
+                  setHoldingKey("");
+                }}>
+                  <span className="material-entity-name"><i />{investor?.display_name || product?.name}</span>
+                  <small>{investor ? `${investorTypeLabels[investor.investor_type]} · ${suitabilityClassLabels[investor.suitability_class || "unknown"]}` : `${product?.code || "产品代码待补"} · ${product?.shares.length || 0} 类份额`}</small>
+                  <span className="material-entity-counts">
+                    <small>{investor ? `${investor.product_ids.length} 个产品` : `${investors.filter((item) => item.product_ids.includes(entry.id)).length} 个投资者`}</small>
+                    <small>{investor ? `${investor.material_count} 份资料` : `${product?.shares.length || 0} 类份额`}</small>
+                  </span>
+                </button>
+              );
+            })}
+            {!filteredEntities.length && <p className="material-list-empty">没有符合条件的主体。</p>}
+          </div>
+        </aside>
+        <div className="share-workspace-content">
+          {selectedEntity ? (
+            <>
+              <header className="share-subject">
+                <div>
+                  <span>当前{perspective === "investor" ? "投资者" : "产品"}</span>
+                  <h2>{selectedInvestor?.display_name || selectedProduct?.name}</h2>
+                  <p>{selectedInvestor
+                    ? `${investorTypeLabels[selectedInvestor.investor_type]} · ${suitabilityClassLabels[selectedInvestor.suitability_class || "unknown"]} · 最新份额以邮件记录为准`
+                    : `${selectedProduct?.code || "产品代码待补"} · 按投资者查看持有份额及来源`}</p>
+                </div>
+                <div className="share-subject-stats">
+                  <div><span>持仓项目</span><strong>{holdings.length}</strong></div>
+                  <div><span>来源邮件</span><strong>{sourceMailCount}</strong></div>
+                  <div className={attentionCount ? "attention" : ""}><span>差异／待处理</span><strong>{attentionCount}</strong></div>
+                </div>
+              </header>
+              <nav className="share-tabs" aria-label="投资者份额分区">
+                {([
+                  ["positions", "当前份额", holdings.length],
+                  ["events", "全部变动", allEvents.length],
+                  ["snapshots", "托管快照", allSnapshots.length],
+                  ["sources", "来源材料", sourceMailCount],
+                ] as [ShareWorkspaceTab, string, number][]).map(([value, label, count]) => (
+                  <button key={value} className={tab === value ? "current" : ""} onClick={() => setTab(value)}>{label}<small>{count}</small></button>
+                ))}
+              </nav>
+              <ErrorNote error={error} />
+              {tab === "positions" && (
+                <div className="share-position-layout">
+                  <section className="share-position-main">
+                    <div className="share-section-heading"><div><strong>{perspective === "investor" ? "当前持有产品" : "当前投资者份额"}</strong><span>以邮件中的最新有效份额或托管快照为准</span></div></div>
+                    {holdings.length ? (
+                      <div className="share-position-list">
+                        {holdings.map((holding) => {
+                          const currentUnits = holdingCurrentUnits(holding);
+                          const hasDifference = holdingHasDifference(holding);
+                          const pending = holding.latestEvent?.status === "pending";
+                          return (
+                            <button key={holding.key} className={holding.key === activeHoldingKey ? "current" : ""} onClick={() => setHoldingKey(holding.key)}>
+                              <span className="share-position-identity"><strong>{holding.title}</strong><small>{holding.subtitle} · 数据日 {holdingDataDate(holding) || "待补充"}</small></span>
+                              <span className="share-position-number"><small>当前份额</small><strong>{currentUnits === null ? "待建立" : number(currentUnits)}</strong></span>
+                              <span className="share-position-change"><small>最近变动</small><strong>{holding.latestEvent ? `${shareEventLabels[holding.latestEvent.event_type]} ${holding.latestEvent.units_delta === null ? "" : number(holding.latestEvent.units_delta)}` : "托管快照"}</strong></span>
+                              <Status state={hasDifference || pending ? "open" : "completed"} text={hasDifference ? "快照差异" : pending ? "待处理" : "已同步"} />
+                              <ChevronRight size={15} />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <Empty title={loading ? "正在读取份额…" : "尚无份额记录"} text="收到并识别投资者份额邮件后，将在这里自动形成当前持仓。" />
+                    )}
+                    {allEvents.length > 0 && (
+                      <div className="share-recent-events">
+                        <div className="share-section-heading"><div><strong>最近变动</strong><span>当前主体的最新业务记录</span></div></div>
+                        <div className="share-compact-table">
+                          <div className="share-compact-row heading"><span>业务日期</span><span>类型</span><span>{perspective === "investor" ? "产品" : "投资者"}</span><span>份额变动</span><span>来源</span></div>
+                          {allEvents.slice(0, 5).map(({ event, investor }) => (
+                            <div className="share-compact-row" key={event.id}><span>{shareEventDate(event) || "待补充"}</span><span>{shareEventLabels[event.event_type]}</span><span>{perspective === "investor" ? event.product_name : investor?.display_name}</span><strong>{event.units_delta === null ? "—" : number(event.units_delta)}</strong><span>{renderSourceAction(event)}</span></div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </section>
+                  <aside className="share-evidence-panel">
+                    {activeHolding ? (() => {
+                      const currentUnits = holdingCurrentUnits(activeHolding);
+                      const hasDifference = holdingHasDifference(activeHolding);
+                      const snapshotIsOlder = Boolean(
+                        activeHolding.position.snapshot_as_of_date &&
+                        shareEventDate(activeHolding.latestEvent) &&
+                        activeHolding.position.snapshot_as_of_date < shareEventDate(activeHolding.latestEvent),
+                      );
+                      return (
+                        <div className="share-evidence-card">
+                          <header><span>份额详情 · 数据依据</span><h3>{activeHolding.title}</h3><p>{activeHolding.subtitle} · 数据日 {holdingDataDate(activeHolding) || "待补充"}</p><div><span><small>当前有效份额</small><strong>{currentUnits === null ? "待建立" : number(currentUnits)}</strong></span><Status state={hasDifference ? "open" : "completed"} text={hasDifference ? "存在差异" : "来源已留痕"} /></div></header>
+                          <section className="share-evidence-chain">
+                            <strong>证据链</strong>
+                            {activeHolding.latestEvent?.source_mail_item_id && <article><i><Mail size={12} /></i><div><strong>{activeHolding.latestEvent.source_mail_title || "投资者份额邮件"}</strong><p>原始邮件 · 接收后只读留存</p><button onClick={() => onOpenMail(activeHolding.latestEvent!.source_mail_item_id!)}>查看原始邮件 <ArrowRight size={11} /></button></div></article>}
+                            {(activeHolding.latestEvent?.source_document_id || activeHolding.latestSnapshot?.source_document_id) && <article><i><FileText size={12} /></i><div><strong>{activeHolding.latestEvent?.source_document_name || "托管份额附件"}</strong><p>邮件附件 · 已关联份额记录</p>{canDownload && <a href={`/api/documents/${activeHolding.latestEvent?.source_document_id || activeHolding.latestSnapshot?.source_document_id}/download`}>下载附件 <ArrowRight size={11} /></a>}</div></article>}
+                            {activeHolding.latestEvent && <article><i><Check size={12} /></i><div><strong>{shareEventLabels[activeHolding.latestEvent.event_type]} {activeHolding.latestEvent.units_delta === null ? "" : number(activeHolding.latestEvent.units_delta)}</strong><p>{shareEventStatusLabels[activeHolding.latestEvent.status]} · 原始记录保留</p></div></article>}
+                            {!activeHolding.latestEvent?.source_mail_item_id && !activeHolding.latestEvent?.source_document_id && !activeHolding.latestSnapshot?.source_document_id && <p className="material-list-empty">来源标识已保存，暂无可直接打开的邮件或附件。</p>}
+                          </section>
+                          <div className={hasDifference ? "share-reconcile attention" : "share-reconcile"}>
+                            {activeHolding.position.latest_snapshot_units !== null
+                              ? snapshotIsOlder
+                                ? `托管快照 ${number(activeHolding.position.latest_snapshot_units)} 早于最新份额邮件，当前份额采用后续邮件中的确认后余额。`
+                                : `托管快照 ${number(activeHolding.position.latest_snapshot_units)}，台账份额 ${activeHolding.position.confirmed_units === null ? "待建立" : number(activeHolding.position.confirmed_units)}。${hasDifference ? `相差 ${number(activeHolding.position.difference)}，请到异常中心处理。` : "两者一致，无需人工核对。"}`
+                              : "尚无托管快照；当前份额来自已接收的份额业务邮件。"}
+                          </div>
+                        </div>
+                      );
+                    })() : <div className="share-evidence-empty">选择一条份额记录查看邮件与附件依据。</div>}
+                  </aside>
+                </div>
+              )}
+              {tab === "events" && <ShareEventList rows={allEvents} perspective={perspective} renderSource={renderSourceAction} />}
+              {tab === "snapshots" && <ShareSnapshotList rows={allSnapshots} renderSource={renderSourceAction} />}
+              {tab === "sources" && <ShareSourceList events={allEvents.map(({ event }) => event)} snapshots={allSnapshots} canDownload={canDownload} onOpenMail={onOpenMail} />}
+            </>
+          ) : <Empty title={perspective === "investor" ? "尚未建立投资者" : "尚未建立产品"} text="建立主体并关联邮件资料后即可查看份额。" />}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ShareEventList({
+  rows,
+  perspective,
+  renderSource,
+}: {
+  rows: { event: InvestorShareEvent; investor?: ShareInvestorSummary | Investor }[];
+  perspective: "investor" | "product";
+  renderSource: (event?: InvestorShareEvent) => ReactNode;
+}) {
+  return rows.length ? <div className="share-tab-list"><div className="share-compact-table full"><div className="share-compact-row event heading"><span>业务日期</span><span>类型</span><span>{perspective === "investor" ? "产品／份额" : "投资者／份额"}</span><span>份额变动</span><span>状态</span><span>来源</span></div>{rows.map(({ event, investor }) => <div className="share-compact-row event" key={event.id}><span>{shareEventDate(event) || "待补充"}</span><span>{shareEventLabels[event.event_type]}</span><span><strong>{perspective === "investor" ? event.product_name : investor?.display_name}</strong><small>{event.share_name || "总份额"}</small></span><strong>{event.units_delta === null ? "—" : number(event.units_delta)}</strong><Status state={event.status === "pending" ? "open" : event.status} text={shareEventStatusLabels[event.status]} /><span>{renderSource(event)}</span></div>)}</div></div> : <Empty title="暂无份额变动" text="申购、赎回、分红和调整记录会按业务日期展示。" />;
+}
+
+function ShareSnapshotList({ rows, renderSource }: { rows: InvestorShareLedger["snapshots"]; renderSource: (event?: InvestorShareEvent, snapshot?: InvestorShareLedger["snapshots"][number]) => ReactNode }) {
+  return rows.length ? <div className="share-tab-list"><div className="share-compact-table full"><div className="share-compact-row snapshot heading"><span>快照日期</span><span>产品</span><span>份额类别</span><span>托管份额</span><span>来源</span></div>{rows.map((snapshot) => <div className="share-compact-row snapshot" key={snapshot.id}><span>{snapshot.as_of_date}</span><span>{snapshot.product_name}</span><span>{snapshot.share_name || "总份额"}</span><strong>{number(snapshot.units)}</strong><span>{renderSource(undefined, snapshot)}</span></div>)}</div></div> : <Empty title="暂无托管快照" text="托管发送的持仓份额表会作为余额依据，不重复计算为份额变动。" />;
+}
+
+function ShareSourceList({ events, snapshots, canDownload, onOpenMail }: { events: InvestorShareEvent[]; snapshots: InvestorShareLedger["snapshots"]; canDownload: boolean; onOpenMail: (id: string) => void }) {
+  const sources = [...events.map((event) => ({ key: `event:${event.id}`, date: shareEventDate(event), title: event.source_mail_title || event.source_document_name || `${event.product_name}份额业务材料`, mailId: event.source_mail_item_id, documentId: event.source_document_id, kind: "份额变动依据" })), ...snapshots.map((snapshot) => ({ key: `snapshot:${snapshot.id}`, date: snapshot.as_of_date, title: `${snapshot.product_name}托管份额快照`, mailId: snapshot.source_mail_item_id, documentId: snapshot.source_document_id, kind: "托管快照" }))].filter((source, index, rows) => rows.findIndex((candidate) => candidate.mailId && candidate.mailId === source.mailId || !candidate.mailId && candidate.documentId && candidate.documentId === source.documentId || candidate.key === source.key) === index);
+  return sources.length ? <div className="share-source-grid">{sources.map((source) => <article key={source.key}><i>{source.mailId ? <Mail size={15} /> : <FileText size={15} />}</i><div><span>{source.kind}</span><strong>{source.title}</strong><small>{source.date || "日期待补充"} · 原件留存</small></div><div>{source.mailId ? <Button variant="outline" onClick={() => onOpenMail(source.mailId!)}>原始邮件</Button> : source.documentId && canDownload ? <a className="icon-link" href={`/api/documents/${source.documentId}/download`}><Download size={15} /></a> : null}</div></article>)}</div> : <Empty title="暂无来源材料" text="份额邮件和托管附件完成关联后会集中显示在这里。" />;
+}
 
 function Status({ state, text }: { state?: string; text?: string }) {
   return (
@@ -493,7 +856,7 @@ function Workspace({
     [mailTarget, setMailTarget] = useState<{ itemId: string; request: number } | null>(null),
     [feedback, setFeedback] = useState(""),
     [search, setSearch] = useState(""),
-    [materialSection, setMaterialSection] = useState<"relations" | "documents" | "pending">("relations"),
+    [materialSection, setMaterialSection] = useState<"relations" | "shares" | "documents" | "pending">("relations"),
     [materialPerspective, setMaterialPerspective] = useState<"product" | "investor">("product"),
     [investorDetailTab, setInvestorDetailTab] = useState<InvestorDetailTab>("basic"),
     [materialEntitySearch, setMaterialEntitySearch] = useState(""),
@@ -573,7 +936,7 @@ function Workspace({
   if (materialSensitivity) materialParams.set("sensitivity", materialSensitivity);
   if (search.trim()) materialParams.set("q", search.trim());
   const materialPageState = useResource<DocPage>(
-    base && perm?.archive && view === "upload"
+    base && perm?.archive && view === "upload" && effectiveMaterialSection !== "shares"
       ? `${base}/documents?${materialParams.toString()}`
       : null,
     revision,
@@ -986,18 +1349,31 @@ function Workspace({
                     <TableCell>
                       {sourceLabel(document.source)}
                       {document.parent_id && <small className="block-sub">邮件附件</small>}
+                      {document.organization_source === "system_parse" && (
+                        <small className="block-sub">解析成功后自动整理</small>
+                      )}
                       <small className="block-sub">{timestamp(document.received_at)}</small>
                     </TableCell>
                     <TableCell>
                       <Status
                         state={document.material_status === "organized" ? "completed" : document.job?.status || "open"}
-                        text={document.material_status === "organized" ? "已整理" : document.job ? undefined : "待整理"}
+                        text={
+                          document.material_status === "organized"
+                            ? document.organization_source === "system_parse"
+                              ? "系统已整理"
+                              : "已整理"
+                            : document.job
+                              ? undefined
+                              : "待整理"
+                        }
                       />
                     </TableCell>
                     <TableCell>
                       <div className="row-actions material-row-actions">
                         {perm?.write && (
-                          <Button variant="outline" onClick={() => setModal({ kind: "material", document })}>整理</Button>
+                          <Button variant="outline" onClick={() => setModal({ kind: "material", document })}>
+                            {document.material_status === "organized" ? "调整" : "整理"}
+                          </Button>
                         )}
                         {perm?.download && (
                           <a className="icon-link" aria-label={`下载 ${document.filename}`} href={`/api/documents/${document.id}/download`}>
@@ -2019,11 +2395,13 @@ function Workspace({
                   <ErrorNote error={docsState.error} />
                   {view === "mail" && base && (
                     <MailWorkspace key={managerId} base={base} boxes={boxes} boxesError={boxesState.error}
-                      revision={revision} canWrite={Boolean(perm?.write)}
+                      revision={revision} canWrite={Boolean(perm?.write)} canManageShares={Boolean(perm?.investor_write)}
                       target={mailTarget}
                       renderDetail={(item) => <MailDetailView key={item.id} item={item} canDownload={Boolean(perm?.download)} />}
                       onAction={(item) => setModal({ kind: "mail-action", item })}
-                      onClassify={(item) => setModal({ kind: "mail-classify", item })} />
+                      onClassify={(item) => setModal({ kind: "mail-classify", item })}
+                      onShareEvent={(item) => setModal({ kind: "share-event", sourceMail: item })}
+                      onPositionSnapshot={(item) => setModal({ kind: "position-snapshot", sourceMail: item })} />
                   )}
                   {view === "upload" && (
                     <>
@@ -2038,6 +2416,20 @@ function Workspace({
                             }}
                           >
                             关系工作台
+                          </button>
+                        )}
+                        {perm?.investor_read && (
+                          <button
+                            className={effectiveMaterialSection === "shares" ? "current" : ""}
+                            onClick={() => {
+                              setMaterialSection("shares");
+                              setMaterialFilter("all");
+                              setMaterialProduct("");
+                              setMaterialInvestor("");
+                              resetMaterialFilters();
+                            }}
+                          >
+                            投资者份额
                           </button>
                         )}
                         <button
@@ -2065,6 +2457,16 @@ function Workspace({
                           待整理 <small>{materialCounts.pending}</small>
                         </button>
                       </div>
+
+                      {effectiveMaterialSection === "shares" && base && (
+                        <InvestorShareWorkspace
+                          revision={revision}
+                          investors={investors}
+                          products={products}
+                          canDownload={Boolean(perm?.download)}
+                          onOpenMail={openOriginalMail}
+                        />
+                      )}
 
                       {effectiveMaterialSection === "relations" && (
                         <section className="material-workbench panel">
@@ -2824,10 +3226,18 @@ function Workspace({
                   material: "整理资料",
                   investor: modal?.kind === "investor" && modal.investor ? "整理投资者" : "建立投资者",
                   "bank-account": modal?.kind === "bank-account" && modal.account ? "编辑银行账户" : "新增银行账户",
+                  "share-event": "整理份额信息",
+                  "position-snapshot": "登记持仓快照",
+                  "share-event-status": modal?.kind === "share-event-status"
+                    ? { confirmed: "确认份额入账", archived: "仅归档份额信息", void: "作废份额信息" }[modal.status]
+                    : "处理份额信息",
                   schedule: "应收配置",
                   lifecycle: "产品生命周期",
                   member: "成员授权",
                   task: "异常详情",
+                  "task-mail-disposition": modal?.kind === "task-mail-disposition"
+                    ? { notification: "设为仅作通知", duplicate: "标记重复邮件", void: "标记误发或作废" }[modal.disposition]
+                    : "处理邮件异常",
                   mailbox: modal?.kind === "mailbox" && modal.mailbox ? "编辑邮箱" : "登记邮箱",
                   "mail-action": "处理邮件待办",
                   "mail-classify": "确认邮件分类",
@@ -2892,6 +3302,33 @@ function Workspace({
           )}
           {modal?.kind === "bank-account" && (
             <InvestorBankAccountForm investor={modal.investor} account={modal.account} products={products} documents={docs} done={done} />
+          )}
+          {modal?.kind === "share-event" && (
+            <InvestorShareEventForm investor={modal.investor} investors={investors} products={products} sourceMail={modal.sourceMail} done={done} />
+          )}
+          {modal?.kind === "position-snapshot" && (
+            <InvestorPositionSnapshotForm investor={modal.investor} investors={investors} products={products} sourceMail={modal.sourceMail} done={done} />
+          )}
+          {modal?.kind === "share-event-status" && (
+            <ActionForm
+              done={done}
+              label={{ confirmed: "确认入账", archived: "仅归档", void: "确认作废" }[modal.status]}
+              submit={(form) => put(`/investor-share-events/${modal.event.id}/status`, {
+                revision: modal.event.revision,
+                status: modal.status,
+                reason: val(form, "reason"),
+              })}
+            >
+              <p className="inline-note">
+                <strong>{modal.event.product_name} · {modal.event.share_name || "未细分份额"}</strong><br />
+                {modal.status === "confirmed"
+                  ? "确认后，这条份额变动将计入持仓汇总。"
+                  : modal.status === "archived"
+                    ? "记录和来源依据会保留，但不会计入持仓。"
+                    : "记录会标记作废，原始邮件和附件仍然保留。"}
+              </p>
+              <Field label="处理依据"><textarea name="reason" required maxLength={2000} rows={4} /></Field>
+            </ActionForm>
           )}
           {modal?.kind === "schedule" && <ScheduleForm product={modal.product} done={done} />}
           {modal?.kind === "lifecycle" && <LifecycleForm product={modal.product} done={done} />}
@@ -3064,6 +3501,31 @@ function Workspace({
               <p className="inline-note">选择净值 / 估值后，受支持的附件才会进入净值解析。</p>
             </ActionForm>
           )}
+          {modal?.kind === "task-mail-disposition" && (
+            <ActionForm
+              done={done}
+              label="确认处理"
+              submit={(form) =>
+                post(`/tasks/${modal.task.id}/mail-disposition`, {
+                  revision: modal.task.revision,
+                  disposition: modal.disposition,
+                  reason: val(form, "reason"),
+                })
+              }
+            >
+              <p className="inline-note">
+                {{
+                  notification: "邮件将改为仅归档，停止未完成的解析并关闭关联的解析异常。",
+                  duplicate: "本次邮件将标记为重复，停止未完成的解析；已有有效业务数据不会被覆盖。",
+                  void: "本次邮件将标记为误发或作废，不再参与后续解析。",
+                }[modal.disposition]}
+                邮件原件和附件仍会完整保留。
+              </p>
+              <Field label="处理依据" hint="说明判断依据，处理结论会写入业务留痕。">
+                <textarea name="reason" required maxLength={2000} rows={5} />
+              </Field>
+            </ActionForm>
+          )}
           {modal?.kind === "rules" && (
             <ActionForm
               done={done}
@@ -3122,6 +3584,9 @@ function Workspace({
               onComplete={(task) => setModal({ kind: "nav", task })}
               onUpload={() => setModal({ kind: "upload" })}
               onOpenMail={openOriginalMail}
+              onMailDisposition={(task, disposition) =>
+                setModal({ kind: "task-mail-disposition", task, disposition })
+              }
             />
           )}
         </DialogContent>
@@ -3137,6 +3602,7 @@ function TaskDetail({
   onComplete,
   onUpload,
   onOpenMail,
+  onMailDisposition,
   documents,
 }: {
   documents: Doc[];
@@ -3146,6 +3612,7 @@ function TaskDetail({
   onComplete: (t: Task) => void;
   onUpload: () => void;
   onOpenMail: (itemId: string) => void;
+  onMailDisposition: (task: Task, disposition: "notification" | "duplicate" | "void") => void;
 }) {
   const [error, setError] = useState(""),
     [selected, setSelected] = useState(""),
@@ -3169,12 +3636,24 @@ function TaskDetail({
         </p>
       ))}
       {task.payload.error && <p className="parse-error">{task.payload.error}</p>}
+      {task.payload.message && <p className="parse-error">{task.payload.message}</p>}
       {task.mail_item_id && manager.permissions.archive &&
         (task.mail_item_category !== "investor_redemption" || manager.permissions.investor_read) && (
           <Button variant="outline" onClick={() => onOpenMail(task.mail_item_id!)}>
             <Mail />
             查看原始邮件
           </Button>
+        )}
+      {task.status !== "resolved" && task.kind !== "investor_share" && task.mail_item_id && canWrite &&
+        (task.mail_item_category !== "investor_redemption" || manager.permissions.investor_write) && (
+          <div className="mail-disposition-actions">
+            <span>这封邮件无需继续形成异常时：</span>
+            <div className="row-actions">
+              <Button variant="outline" onClick={() => onMailDisposition(task, "notification")}>仅作通知</Button>
+              <Button variant="outline" onClick={() => onMailDisposition(task, "duplicate")}>重复邮件</Button>
+              <Button variant="outline" onClick={() => onMailDisposition(task, "void")}>误发 / 作废</Button>
+            </div>
+          </div>
         )}
       {task.payload.document_id && manager.permissions.download && (
         <a className="text-link" href={`/api/documents/${task.payload.document_id}/download`}>
@@ -3258,6 +3737,53 @@ function TaskDetail({
                 </ActionForm>
               )}
             </>
+          )}
+          {task.kind === "investor_share" && (
+            <div className="investor-share-task">
+              <div className="investor-share-task-grid">
+                <div><span>投资者</span><strong>{task.investor_name || "待识别"}</strong></div>
+                <div><span>产品</span><strong>{task.product_name}</strong></div>
+                <div><span>异常原因</span><strong>{task.payload.reason === "position_difference" ? "托管快照差异" : task.payload.missing_mail ? "缺少邮件依据" : "确认字段不完整"}</strong></div>
+                <div><span>业务日期</span><strong>{task.valuation_date || task.payload.as_of_date || "待补充"}</strong></div>
+              </div>
+              {task.investor_share_event && (
+                <div className="investor-share-task-record">
+                  <strong>{shareEventLabels[task.investor_share_event.event_type]} · {task.investor_share_event.share_name || "总份额"}</strong>
+                  <span>份额变动 {task.investor_share_event.units_delta === null ? "未提供" : number(task.investor_share_event.units_delta)}</span>
+                  <span>确认后份额 {task.investor_share_event.balance_after === null ? "未提供" : number(task.investor_share_event.balance_after)}</span>
+                </div>
+              )}
+              {task.investor_position_snapshot && (
+                <div className="investor-share-task-record">
+                  <strong>托管快照 · {task.investor_position_snapshot.share_name || "总份额"}</strong>
+                  <span>托管份额 {number(task.investor_position_snapshot.units)}</span>
+                  <span>差异 {number(task.payload.difference)}</span>
+                </div>
+              )}
+              {task.investor_share_event?.status === "pending" && manager.permissions.investor_write && (
+                <ActionForm
+                  label="保存处理结论"
+                  done={done}
+                  submit={(form) => put(`/investor-share-events/${task.investor_share_event!.id}/status`, {
+                    revision: task.investor_share_event!.revision,
+                    status: val(form, "status"),
+                    reason: val(form, "reason"),
+                  })}
+                >
+                  <Field label="处理方式">
+                    <select name="status" defaultValue="archived">
+                      <option value="archived">仅保留来源，不计入份额</option>
+                      <option value="void">误发或错误记录，作废</option>
+                    </select>
+                  </Field>
+                  <Field label="处理说明"><textarea name="reason" required maxLength={2000} /></Field>
+                  <p className="inline-note">需要计入份额时，请从原始邮件重新整理完整记录；旧记录和本次结论都会保留。</p>
+                </ActionForm>
+              )}
+              {task.investor_position_snapshot && (
+                <p className="inline-note">收到更新后的托管快照并登记后，旧差异会自动关闭；当前记录不会被直接改写。</p>
+              )}
+            </div>
           )}
           {canProcess && ["parse", "validation"].includes(task.kind) && (
             <div className="row-actions">

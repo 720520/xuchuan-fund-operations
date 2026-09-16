@@ -495,6 +495,8 @@ def classify(message: Message, folder=""):
         all_text, ("投资监督", "违反", "违规", "超限", "交割月风险", "风险提示")
     ):
         return Classification("risk_monitoring", "task", "high", 96, "核查风险或投资监督事项")
+    if _contains(subject_and_files, ("投资人份额", "投资者份额", "持仓份额表")):
+        return Classification("investor_redemption", "receipt", "normal", 98)
     if _contains(subject_and_files, ("估值表", "估值文件", "净值", "单位净值")):
         return Classification("nav_valuation", "receipt", "normal", 96)
     if _contains(folder_text, ("基金估值", "净值")):
@@ -570,10 +572,37 @@ def _route_attachments(db, original, nav_candidate):
         if not child.filename.lower().endswith(SUPPORTED_NAV_ATTACHMENTS):
             continue
         job = db.scalar(select(ParseJob).where(ParseJob.document_id == child.id))
+        duplicate_job = db.scalar(
+            select(ParseJob)
+            .join(Document, Document.id == ParseJob.document_id)
+            .where(
+                Document.manager_id == child.manager_id,
+                Document.sha256 == child.sha256,
+                Document.id != child.id,
+                ParseJob.status.in_(
+                    ["queued", "processing", "review", "completed", "manual_completed"]
+                ),
+            )
+            .order_by(Document.received_at, Document.id)
+            .limit(1)
+        )
         if nav_candidate:
             if not job:
-                db.add(ParseJob(manager_id=original.manager_id, document_id=child.id))
-            elif job.status == "skipped":
+                if duplicate_job:
+                    db.add(
+                        ParseJob(
+                            manager_id=original.manager_id,
+                            document_id=child.id,
+                            status="skipped",
+                            result={
+                                "reason": "附件内容与已归档材料完全相同，不重复解析",
+                                "duplicate_document_id": duplicate_job.document_id,
+                            },
+                        )
+                    )
+                else:
+                    db.add(ParseJob(manager_id=original.manager_id, document_id=child.id))
+            elif job.status == "skipped" and not duplicate_job:
                 job.status = "queued"
                 job.updated_at = now()
                 job.result = {}
@@ -673,7 +702,9 @@ def apply_manual_classification(db, item, category, handling_mode, suggested_act
         action.result = {"reason": "人工分类后无需待办"}
         action.updated_at = now()
         action.revision += 1
-    _route_attachments(db, original, category == "nav_valuation")
+    _route_attachments(
+        db, original, category == "nav_valuation" and handling_mode != "archive"
+    )
     return item
 
 

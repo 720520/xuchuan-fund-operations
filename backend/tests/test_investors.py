@@ -1,14 +1,24 @@
+from io import BytesIO
+
 from app.mailbox_security import decrypt_sensitive_value
 from app.models import (
     AuditEvent,
+    Document,
+    DocumentMaterial,
+    ExceptionTask,
     Investor,
     InvestorBankAccount,
     InvestorBankAccountProduct,
+    InvestorPositionSnapshot,
+    MailAction,
+    MailItem,
     Membership,
     User,
 )
 from app.security import password_hash
+from app.services import archive, import_investor_position_documents
 from conftest import PASSWORD, login, product
+from openpyxl import Workbook
 from sqlalchemy import select
 
 
@@ -366,3 +376,334 @@ def test_structured_profile_and_bank_accounts_encrypt_sensitive_numbers(env):
     assert preserved.json()["certificate_number_masked"] == "3401********4539"
     with app.state.factory() as db:
         assert db.get(Investor, investor["id"]).certificate_number_ciphertext == original_ciphertext
+
+
+def test_share_events_require_confirmation_and_preserve_position_evidence(env):
+    _, client, ids = env
+    login(client)
+    owned_product = product(client, ids["a"], "INV009")
+    investor = client.post(
+        f"/api/managers/{ids['a']}/investors",
+        json=investor_payload([owned_product["id"]], status="confirmed"),
+    ).json()
+
+    notice = client.post(
+        f"/api/investors/{investor['id']}/share-events",
+        json={
+            "product_id": owned_product["id"],
+            "share_id": owned_product["shares"][0]["id"],
+            "event_type": "subscription",
+            "evidence_stage": "notice",
+            "application_date": "2026-09-14",
+            "requested_amount": "100000.00",
+            "notes": "仅收到申请通知",
+        },
+    )
+    assert notice.status_code == 201, notice.text
+    assert notice.json()["status"] == "archived"
+
+    invalid_redemption = client.post(
+        f"/api/investors/{investor['id']}/share-events",
+        json={
+            "product_id": owned_product["id"],
+            "event_type": "redemption",
+            "evidence_stage": "application",
+            "units_delta": "100",
+        },
+    )
+    assert invalid_redemption.status_code == 422
+
+    confirmation = client.post(
+        f"/api/investors/{investor['id']}/share-events",
+        json={
+            "product_id": owned_product["id"],
+            "share_id": owned_product["shares"][0]["id"],
+            "event_type": "subscription",
+            "evidence_stage": "confirmation",
+            "confirmation_date": "2026-09-15",
+            "effective_date": "2026-09-15",
+            "confirmed_amount": "100000.00",
+            "units_delta": "95238.095238",
+            "unit_nav": "1.05000000",
+            "balance_after": "95238.095238",
+            "business_ref": "ORDER-20260915-001",
+            "notes": "托管确认单",
+        },
+    )
+    assert confirmation.status_code == 201, confirmation.text
+    event = confirmation.json()
+    assert event["status"] == "pending"
+    tasks = client.get(f"/api/managers/{ids['a']}/tasks").json()
+    share_task = next(item for item in tasks if item["kind"] == "investor_share")
+    assert share_task["investor_name"] == investor["display_name"]
+    assert share_task["payload"]["reason"] == "source_mail_missing"
+    before = client.get(f"/api/investors/{investor['id']}/share-events").json()
+    assert before["positions"] == []
+
+    confirmed = client.put(
+        f"/api/investor-share-events/{event['id']}/status",
+        json={"revision": 1, "status": "confirmed", "reason": "已与托管确认单核对"},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "confirmed"
+    resolved = next(
+        item
+        for item in client.get(f"/api/managers/{ids['a']}/tasks").json()
+        if item["id"] == share_task["id"]
+    )
+    assert resolved["status"] == "resolved"
+    assert client.put(
+        f"/api/investor-share-events/{event['id']}/status",
+        json={"revision": 2, "status": "void", "reason": "尝试覆盖历史"},
+    ).status_code == 409
+
+    snapshot = client.post(
+        f"/api/investors/{investor['id']}/position-snapshots",
+        json={
+            "product_id": owned_product["id"],
+            "share_id": owned_product["shares"][0]["id"],
+            "as_of_date": "2026-09-15",
+            "units": "95238.095238",
+            "notes": "托管持仓表",
+        },
+    )
+    assert snapshot.status_code == 201, snapshot.text
+    ledger = client.get(f"/api/investors/{investor['id']}/share-events").json()
+    assert ledger["positions"][0]["confirmed_units"] == "95238.095238"
+    assert ledger["positions"][0]["latest_snapshot_units"] == "95238.095238"
+    assert ledger["positions"][0]["difference"] == "0.000000"
+    assert [item["status"] for item in ledger["events"]] == ["confirmed", "archived"]
+
+    duplicate = client.post(
+        f"/api/investors/{investor['id']}/share-events",
+        json={
+            "product_id": owned_product["id"],
+            "event_type": "subscription",
+            "evidence_stage": "confirmation",
+            "confirmation_date": "2026-09-15",
+            "business_ref": "ORDER-20260915-001",
+        },
+    )
+    assert duplicate.status_code == 409
+
+
+def test_mail_confirmation_auto_posts_and_product_ledger_aggregates(env):
+    app, client, ids = env
+    login(client)
+    owned_product = product(client, ids["a"], "INV010")
+    investor = client.post(
+        f"/api/managers/{ids['a']}/investors",
+        json=investor_payload([owned_product["id"]], status="confirmed"),
+    ).json()
+
+    with app.state.factory.begin() as db:
+        document = Document(
+            manager_id=ids["a"],
+            filename="investor-share-confirmation.eml",
+            sha256="1" * 64,
+            storage_key="test/investor-share-confirmation.eml",
+            size=128,
+            media_type="message/rfc822",
+            source="email",
+            metadata_json={},
+        )
+        db.add(document)
+        db.flush()
+        mail_item = MailItem(
+            manager_id=ids["a"],
+            document_id=document.id,
+            category="investor_redemption",
+            title="投资者份额确认",
+            sender="custodian@example.invalid",
+            business_date="2026-09-15",
+            handling_mode="task",
+            priority="normal",
+            classification_source="rule",
+            confidence=95,
+            status="received",
+            excerpt="确认后份额 120000.000000",
+        )
+        db.add(mail_item)
+        db.flush()
+        db.add(
+            MailAction(
+                manager_id=ids["a"],
+                mail_item_id=mail_item.id,
+                suggested_action="整理投资者份额",
+            )
+        )
+        mail_item_id = mail_item.id
+
+    created = client.post(
+        f"/api/investors/{investor['id']}/share-events",
+        json={
+            "product_id": owned_product["id"],
+            "share_id": owned_product["shares"][0]["id"],
+            "event_type": "subscription",
+            "evidence_stage": "confirmation",
+            "confirmation_date": "2026-09-15",
+            "units_delta": "120000.000000",
+            "balance_after": "120000.000000",
+            "business_ref": "MAIL-CONFIRM-001",
+            "source_mail_item_id": mail_item_id,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["status"] == "confirmed"
+    assert created.json()["confirmed_at"]
+
+    investor_ledger = client.get(
+        f"/api/investors/{investor['id']}/share-events"
+    ).json()
+    assert investor_ledger["positions"][0]["current_units"] == "120000.000000"
+    assert investor_ledger["positions"][0]["current_source"] == "event_balance"
+
+    product_ledger = client.get(
+        f"/api/products/{owned_product['id']}/investor-shares"
+    )
+    assert product_ledger.status_code == 200, product_ledger.text
+    product_rows = product_ledger.json()["investors"]
+    assert product_rows[0]["investor"]["id"] == investor["id"]
+    assert product_rows[0]["ledger"]["positions"][0]["current_units"] == "120000.000000"
+
+    with app.state.factory() as db:
+        action = db.scalar(
+            select(MailAction).where(MailAction.mail_item_id == mail_item_id)
+        )
+        assert action.status == "completed"
+        assert action.result["object_type"] == "share_event"
+        assert not db.scalar(
+            select(ExceptionTask).where(
+                ExceptionTask.manager_id == ids["a"],
+                ExceptionTask.kind == "investor_share",
+                ExceptionTask.status != "resolved",
+            )
+        )
+
+    mismatch = client.post(
+        f"/api/investors/{investor['id']}/position-snapshots",
+        json={
+            "product_id": owned_product["id"],
+            "share_id": owned_product["shares"][0]["id"],
+            "as_of_date": "2026-09-15",
+            "units": "119000.000000",
+            "source_mail_item_id": mail_item_id,
+        },
+    )
+    assert mismatch.status_code == 201, mismatch.text
+    tasks = client.get(f"/api/managers/{ids['a']}/tasks").json()
+    difference = next(
+        item
+        for item in tasks
+        if item["kind"] == "investor_share" and item["status"] != "resolved"
+    )
+    assert difference["payload"]["reason"] == "position_difference"
+    assert difference["mail_item_id"] == mail_item_id
+    assert difference["investor_position_snapshot"]["units"] == "119000.000000"
+
+    login(client, "fund")
+    assert all(
+        item["kind"] != "investor_share"
+        for item in client.get(f"/api/managers/{ids['a']}/tasks").json()
+    )
+
+
+def test_custodian_position_statement_auto_imports_and_is_idempotent(env):
+    app, client, ids = env
+    login(client)
+    owned_product = product(client, ids["a"], "CUST01", shares=["总"])
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "日间净值列表"
+    sheet.append(
+        [
+            "产品代码",
+            "产品名称",
+            "投资者名称",
+            "份额日期",
+            "持有份额",
+            "份额最后变动日期",
+            "占同级别份额比例",
+            "产品总份额",
+        ]
+    )
+    sheet.append(
+        [
+            owned_product["code"],
+            owned_product["name"],
+            "托管表新增投资者",
+            "2026-09-15",
+            "123456.780000",
+            "2026-09-10",
+            "10%",
+            "1234567.8",
+        ]
+    )
+    content = BytesIO()
+    workbook.save(content)
+
+    with app.state.factory.begin() as db:
+        original = archive(
+            db,
+            app.state.settings,
+            ids["a"],
+            "investor-position.eml",
+            b"From: custodian@example.invalid\nSubject: investor positions\n\nbody",
+            "email",
+        )
+        mail_item = MailItem(
+            manager_id=ids["a"],
+            document_id=original.id,
+            category="investor_redemption",
+            title="投资人份额日报",
+            sender="custodian@example.invalid",
+            handling_mode="receipt",
+            priority="normal",
+            classification_source="rule",
+            confidence=95,
+            status="received",
+        )
+        db.add(mail_item)
+        db.flush()
+        attachment = archive(
+            db,
+            app.state.settings,
+            ids["a"],
+            "投资人份额.xlsx",
+            content.getvalue(),
+            "email_attachment",
+            parent_id=original.id,
+        )
+        attachment_id = attachment.id
+        mail_item_id = mail_item.id
+
+    with app.state.factory.begin() as db:
+        assert import_investor_position_documents(db, app.state.settings) == 1
+    with app.state.factory.begin() as db:
+        assert import_investor_position_documents(db, app.state.settings) == 0
+
+    with app.state.factory() as db:
+        investor = db.scalar(
+            select(Investor).where(Investor.display_name == "托管表新增投资者")
+        )
+        assert investor.status == "pending"
+        assert investor.source == "material"
+        snapshot = db.scalar(
+            select(InvestorPositionSnapshot).where(
+                InvestorPositionSnapshot.investor_id == investor.id
+            )
+        )
+        assert str(snapshot.units) == "123456.780000"
+        assert snapshot.source_mail_item_id == mail_item_id
+        assert snapshot.source_document_id == attachment_id
+        material = db.get(DocumentMaterial, attachment_id)
+        assert material.material_type == "position_statement"
+        assert material.sensitivity == "investor_sensitive"
+        assert material.organization_source == "automatic"
+
+    investors = client.get(f"/api/managers/{ids['a']}/investors").json()
+    imported = next(item for item in investors if item["id"] == investor.id)
+    assert imported["product_ids"] == [owned_product["id"]]
+    ledger = client.get(f"/api/investors/{investor.id}/share-events").json()
+    assert ledger["positions"][0]["current_units"] == "123456.780000"
+    assert ledger["positions"][0]["current_source"] == "snapshot"

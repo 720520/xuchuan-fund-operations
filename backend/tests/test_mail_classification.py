@@ -5,7 +5,16 @@ from sqlalchemy import select
 from app.mail_classification import classify, classify_pending_mail
 from app.mail_sync import ingest_message
 from app.mailbox_security import selectable_folders
-from app.models import Document, MailAction, MailItem, Mailbox, Membership, ParseJob, User
+from app.models import (
+    Document,
+    ExceptionTask,
+    MailAction,
+    MailItem,
+    Mailbox,
+    Membership,
+    ParseJob,
+    User,
+)
 from app.security import password_hash
 from app.services import archive, task
 from conftest import PASSWORD, login
@@ -42,9 +51,56 @@ def mailbox(db, manager_id):
 def test_rules_separate_nav_tasks_and_unknown_mail():
     assert classify(message("每日估值表")).category == "nav_valuation"
     assert classify(message("1940产品20260907"), "基金估值表").category == "nav_valuation"
+    positions = classify(
+        message(
+            "【投资人份额】产品持仓日报",
+            attachment="投资人份额_20260915.xlsx",
+        )
+    )
+    assert (positions.category, positions.handling_mode) == (
+        "investor_redemption",
+        "receipt",
+    )
     risk = classify(message("投资监督违规提醒", "请核查相关交易。"))
     assert (risk.handling_mode, risk.priority) == ("task", "high")
     assert classify(message("普通通知", attachment="说明.pdf")).handling_mode == "pending"
+
+
+def test_same_attachment_in_changed_email_is_not_parsed_twice(env):
+    app, _, ids = env
+    with app.state.factory.begin() as db:
+        box = mailbox(db, ids["a"])
+        first_id = ingest_message(
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "first-nav",
+            message("产品净值表", attachment="产品净值.xlsx").as_bytes(),
+        )
+        second_id = ingest_message(
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "resent-nav",
+            message("产品净值表（重发）", attachment="产品净值.xlsx").as_bytes(),
+        )
+        first_attachment = db.scalar(
+            select(Document).where(Document.parent_id == first_id)
+        )
+        second_attachment = db.scalar(
+            select(Document).where(Document.parent_id == second_id)
+        )
+        first_job = db.scalar(
+            select(ParseJob).where(ParseJob.document_id == first_attachment.id)
+        )
+        second_job = db.scalar(
+            select(ParseJob).where(ParseJob.document_id == second_attachment.id)
+        )
+        assert first_job.status == "queued"
+        assert second_job.status == "skipped"
+        assert second_job.result["duplicate_document_id"] == first_attachment.id
 
 
 def test_html_style_and_script_are_not_shown_in_mail_excerpt(env):
@@ -179,6 +235,101 @@ def test_exception_links_attachment_back_to_original_mail(env):
     ).json()
     assert exact["total"] == 1
     assert exact["items"][0]["id"] == mail_item_id
+
+
+def test_mail_disposition_closes_exception_and_stops_pending_parse(env):
+    app, client, ids = env
+    with app.state.factory.begin() as db:
+        box = mailbox(db, ids["a"])
+        original_id = ingest_message(
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "duplicate-nav",
+            message("产品净值表", attachment="重复净值.xlsx").as_bytes(),
+        )
+        mail_item = db.scalar(
+            select(MailItem).where(MailItem.document_id == original_id)
+        )
+        attachment_id = db.scalar(
+            select(Document.id).where(Document.parent_id == original_id)
+        )
+        issue = task(
+            db,
+            ids["a"],
+            "parse",
+            "parse:duplicate-mail-test",
+            {"document_id": attachment_id, "errors": [{"reason": "模板待确认"}]},
+        )
+        issue_id, revision, mail_item_id = issue.id, issue.revision, mail_item.id
+
+    login(client)
+    response = client.post(
+        f"/api/tasks/{issue_id}/mail-disposition",
+        json={
+            "revision": revision,
+            "disposition": "duplicate",
+            "reason": "与当日已归档净值材料内容相同",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["resolved_exceptions"] == 1
+    with app.state.factory() as db:
+        issue = db.get(ExceptionTask, issue_id)
+        assert issue.status == "resolved"
+        assert issue.resolution["disposition"] == "duplicate"
+        mail_item = db.get(MailItem, mail_item_id)
+        assert (mail_item.handling_mode, mail_item.status) == ("archive", "completed")
+        job = db.scalar(select(ParseJob).where(ParseJob.document_id == attachment_id))
+        assert job.status == "skipped"
+        assert job.result["mail_disposition"] == "duplicate"
+
+
+def test_non_nav_manual_classification_resolves_existing_parse_exception(env):
+    app, client, ids = env
+    with app.state.factory.begin() as db:
+        box = mailbox(db, ids["a"])
+        original_id = ingest_message(
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "notification-nav",
+            message("净值业务通知", attachment="通知附件.xlsx").as_bytes(),
+        )
+        mail_item = db.scalar(
+            select(MailItem).where(MailItem.document_id == original_id)
+        )
+        attachment_id = db.scalar(
+            select(Document.id).where(Document.parent_id == original_id)
+        )
+        issue = task(
+            db,
+            ids["a"],
+            "parse",
+            "parse:notification-mail-test",
+            {"document_id": attachment_id, "errors": [{"reason": "不应继续解析"}]},
+        )
+        item_id, item_revision, issue_id = mail_item.id, mail_item.revision, issue.id
+
+    login(client)
+    response = client.put(
+        f"/api/mail-items/{item_id}/classification",
+        json={
+            "revision": item_revision,
+            "category": "other",
+            "handling_mode": "archive",
+            "suggested_action": None,
+        },
+    )
+    assert response.status_code == 200
+    with app.state.factory() as db:
+        issue = db.get(ExceptionTask, issue_id)
+        assert issue.status == "resolved"
+        assert issue.resolution["disposition"] == "classification"
+        job = db.scalar(select(ParseJob).where(ParseJob.document_id == attachment_id))
+        assert job.status == "skipped"
 
 
 def test_investor_mail_original_and_attachments_require_investor_permission(env):
@@ -361,6 +512,7 @@ def test_mailbox_paging_includes_shared_mail_and_checks_scope(env):
     other = client.get(url, params={'paginated': True, 'mailbox_id': second_id}).json()
     assert other['total'] == 1
     assert other['items'][0]['document_id'] == shared
+    assert other['items'][0]['receipt_count'] == 2
     assert {s['mailbox_id'] for s in other['items'][0]['sources']} == {first_id, second_id}
     searched = client.get(url, params={'paginated': True, 'mailbox_id': first_id, 'q': '独有'}).json()
     assert searched['total'] == 1

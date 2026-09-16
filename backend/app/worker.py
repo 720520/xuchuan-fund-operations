@@ -12,7 +12,13 @@ from .db import connect, now
 from .mail_classification import classify_pending_mail
 from .mail_sync import sync_mailbox
 from .models import Document, DocumentMaterial, Mailbox, MailItem, ParseJob
-from .services import process_document, task
+from .services import (
+    import_investor_position_documents,
+    organize_completed_nav_documents,
+    process_document,
+    reconcile_pending_investor_share_events,
+    task,
+)
 
 log = logging.getLogger("xuchuan.worker")
 
@@ -134,10 +140,17 @@ def run_once(factory, settings, mail=False):
     # Older archives may predate mail routing. Classify them before any queued
     # attachment can be mistaken for a NAV candidate.
     classify_pending_mail(factory, settings)
+    with factory.begin() as db:
+        import_investor_position_documents(db, settings)
     for _ in range(100):
         if not parse_one(factory, settings):
             break
         parsed += 1
+    # Existing completed NAV files are upgraded to organized material metadata
+    # in bounded, idempotent batches after deployment.
+    with factory.begin() as db:
+        organize_completed_nav_documents(db)
+        reconcile_pending_investor_share_events(db)
     from .receipts import run_receipt_checks
     run_receipt_checks(factory)
     if mail:

@@ -55,7 +55,9 @@ from .models import (
     Investor,
     InvestorBankAccount,
     InvestorBankAccountProduct,
+    InvestorPositionSnapshot,
     InvestorProduct,
+    InvestorShareEvent,
     MailAction,
     Mailbox,
     MailItem,
@@ -107,6 +109,7 @@ from .services import (
     performance,
     refresh_missing,
     select_effective,
+    task,
 )
 
 
@@ -293,6 +296,7 @@ def create_app(settings=None):
             "notes": material.notes if material else "",
             "sensitivity": material.sensitivity if material else "standard",
             "material_status": material.status if material else "pending",
+            "organization_source": material.organization_source if material else None,
             "material_revision": material.revision if material else 0,
             "organized_at": material.confirmed_at if material else None,
             "organized_by": material.confirmed_by if material else None,
@@ -482,12 +486,457 @@ def create_app(settings=None):
                 )
             )
 
+    def share_decimal(value, label, scale=6):
+        if value in (None, ""):
+            return None
+        try:
+            parsed = Decimal(value)
+            quantum = Decimal(1).scaleb(-scale)
+            if not parsed.is_finite() or parsed != parsed.quantize(quantum):
+                raise ValueError
+            return parsed
+        except (InvalidOperation, ValueError):
+            raise HTTPException(422, f"{label}不是有效数字或小数位过多")
+
+    def share_event_context(
+        session, investor, product_id, share_id=None, mail_item_id=None,
+        document_id=None, supersedes_event_id=None,
+    ):
+        product = session.get(Product, product_id)
+        if not product or product.manager_id != investor.manager_id:
+            raise HTTPException(422, "关联产品不存在或不属于当前牌照")
+        share = None
+        if share_id:
+            share = session.get(ShareClass, share_id)
+            if not share or share.manager_id != investor.manager_id or share.product_id != product.id:
+                raise HTTPException(422, "份额类别不存在或不属于所选产品")
+        mail_item = None
+        if mail_item_id:
+            mail_item = session.get(MailItem, mail_item_id)
+            if not mail_item or mail_item.manager_id != investor.manager_id:
+                raise HTTPException(422, "来源邮件不存在或不属于当前牌照")
+        document = None
+        if document_id:
+            document = session.get(Document, document_id)
+            if not document or document.manager_id != investor.manager_id:
+                raise HTTPException(422, "来源原件不存在或不属于当前牌照")
+            if mail_item and document.id not in mail_document_ids(session, mail_item):
+                raise HTTPException(422, "来源附件不属于所选邮件")
+        supersedes = None
+        if supersedes_event_id:
+            supersedes = session.get(InvestorShareEvent, supersedes_event_id)
+            if (
+                not supersedes
+                or supersedes.manager_id != investor.manager_id
+                or supersedes.investor_id != investor.id
+                or supersedes.product_id != product.id
+            ):
+                raise HTTPException(422, "被更正的份额记录不存在或业务主体不一致")
+        return product, share, mail_item, document, supersedes
+
+    def ensure_investor_product(session, actor, investor, product_id):
+        relation = session.scalar(
+            select(InvestorProduct).where(
+                InvestorProduct.investor_id == investor.id,
+                InvestorProduct.product_id == product_id,
+            )
+        )
+        if not relation:
+            session.add(
+                InvestorProduct(
+                    manager_id=investor.manager_id,
+                    investor_id=investor.id,
+                    product_id=product_id,
+                    status="confirmed",
+                    created_by=actor.id,
+                    created_at=now(),
+                )
+            )
+
+    def link_share_source_material(
+        session, actor, investor, product_id, document, event_type, evidence_stage
+    ):
+        if not document:
+            return
+        material = session.get(DocumentMaterial, document.id)
+        timestamp = now()
+        if not material:
+            if evidence_stage == "snapshot":
+                material_type = "position_statement"
+            elif evidence_stage == "confirmation":
+                material_type = "share_confirmation"
+            elif event_type in {"redemption", "full_redemption"}:
+                material_type = "redemption_form"
+            elif event_type in {"cash_dividend", "dividend_reinvestment"}:
+                material_type = "dividend_notice"
+            else:
+                material_type = "subscription_form"
+            material = DocumentMaterial(
+                document_id=document.id,
+                manager_id=investor.manager_id,
+                category="subscription_redemption",
+                material_type=material_type,
+                title=document.filename,
+                notes="由投资者份额信息整理时建立",
+                sensitivity="investor_sensitive",
+                status="organized",
+                organization_source="manual",
+                confirmed_by=actor.id,
+                confirmed_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+                revision=1,
+            )
+            session.add(material)
+        elif material.sensitivity != "investor_sensitive":
+            material.sensitivity = "investor_sensitive"
+            material.updated_at = timestamp
+            material.revision += 1
+        if not session.scalar(select(DocumentMaterialInvestor.id).where(
+            DocumentMaterialInvestor.document_id == document.id,
+            DocumentMaterialInvestor.investor_id == investor.id,
+        )):
+            session.add(DocumentMaterialInvestor(
+                manager_id=investor.manager_id,
+                document_id=document.id,
+                investor_id=investor.id,
+                created_at=now(),
+            ))
+        if not session.scalar(select(DocumentMaterialProduct.id).where(
+            DocumentMaterialProduct.document_id == document.id,
+            DocumentMaterialProduct.product_id == product_id,
+        )):
+            session.add(DocumentMaterialProduct(
+                manager_id=investor.manager_id,
+                document_id=document.id,
+                product_id=product_id,
+                created_at=now(),
+            ))
+
+    def complete_share_mail_action(session, mail_item, object_type, object_id):
+        if not mail_item:
+            return
+        action = session.scalar(
+            select(MailAction).where(MailAction.mail_item_id == mail_item.id)
+        )
+        if not action or action.status != "open":
+            return
+        action.status = "completed"
+        action.result = {
+            "via": "investor_share_organization",
+            "object_type": object_type,
+            "object_id": object_id,
+        }
+        action.updated_at = now()
+        action.revision += 1
+
+    def share_event_result(session, event):
+        product = session.get(Product, event.product_id)
+        share = session.get(ShareClass, event.share_id) if event.share_id else None
+        mail_item = session.get(MailItem, event.source_mail_item_id) if event.source_mail_item_id else None
+        document = session.get(Document, event.source_document_id) if event.source_document_id else None
+        values = row(event)
+        for field in (
+            "requested_amount", "confirmed_amount", "units_delta", "unit_nav",
+            "fee_amount", "balance_after",
+        ):
+            values[field] = str(getattr(event, field)) if getattr(event, field) is not None else None
+        return {
+            **values,
+            "product_name": product.name if product else "",
+            "share_name": share.name if share else None,
+            "source_mail_title": mail_item.title if mail_item else None,
+            "source_document_name": document.filename if document else None,
+        }
+
+    def share_event_date(event):
+        return event.effective_date or event.confirmation_date or event.application_date or ""
+
+    def share_ledger_result(session, investor, product_id=None):
+        event_query = select(InvestorShareEvent).where(
+            InvestorShareEvent.investor_id == investor.id
+        )
+        snapshot_query = select(InvestorPositionSnapshot).where(
+            InvestorPositionSnapshot.investor_id == investor.id
+        )
+        if product_id:
+            event_query = event_query.where(InvestorShareEvent.product_id == product_id)
+            snapshot_query = snapshot_query.where(InvestorPositionSnapshot.product_id == product_id)
+        events = list(session.scalars(event_query.order_by(
+            InvestorShareEvent.effective_date.desc(),
+            InvestorShareEvent.confirmation_date.desc(),
+            InvestorShareEvent.created_at.desc(),
+        )))
+        snapshots = list(session.scalars(snapshot_query.order_by(
+            InvestorPositionSnapshot.as_of_date.desc(),
+            InvestorPositionSnapshot.created_at.desc(),
+        )))
+        superseded_event_ids = {
+            event.supersedes_event_id
+            for event in events
+            if event.status != "void" and event.supersedes_event_id
+        }
+        confirmed_units = {}
+        latest_confirmed_events = {}
+        for event in events:
+            if event.status != "confirmed" or event.id in superseded_event_ids:
+                continue
+            key = (event.product_id, event.share_id)
+            latest_confirmed_events.setdefault(key, event)
+            if event.units_delta is not None:
+                confirmed_units[key] = confirmed_units.get(key, Decimal("0")) + event.units_delta
+        latest_snapshots = {}
+        for snapshot in snapshots:
+            latest_snapshots.setdefault((snapshot.product_id, snapshot.share_id), snapshot)
+        position_rows = []
+        for key in sorted(set(confirmed_units) | set(latest_confirmed_events) | set(latest_snapshots)):
+            linked_product = session.get(Product, key[0])
+            linked_share = session.get(ShareClass, key[1]) if key[1] else None
+            calculated = confirmed_units.get(key)
+            latest_event = latest_confirmed_events.get(key)
+            snapshot = latest_snapshots.get(key)
+            event_date = share_event_date(latest_event) if latest_event else ""
+            snapshot_date = snapshot.as_of_date if snapshot else ""
+            if snapshot and snapshot_date >= event_date:
+                current_units = snapshot.units
+                current_date = snapshot_date
+                current_source = "snapshot"
+            elif latest_event and latest_event.balance_after is not None:
+                current_units = latest_event.balance_after
+                current_date = event_date
+                current_source = "event_balance"
+            else:
+                current_units = calculated if calculated is not None else (snapshot.units if snapshot else None)
+                current_date = event_date or snapshot_date or None
+                current_source = "event_delta" if calculated is not None else "snapshot"
+            comparable_balance = None
+            if snapshot and latest_event and event_date == snapshot_date and latest_event.balance_after is not None:
+                comparable_balance = latest_event.balance_after
+            difference = snapshot.units - comparable_balance if comparable_balance is not None else None
+            position_rows.append({
+                "product_id": key[0],
+                "product_name": linked_product.name if linked_product else "",
+                "share_id": key[1],
+                "share_name": linked_share.name if linked_share else None,
+                "confirmed_units": str(calculated) if calculated is not None else None,
+                "latest_snapshot_units": str(snapshot.units) if snapshot else None,
+                "snapshot_as_of_date": snapshot.as_of_date if snapshot else None,
+                "difference": str(difference) if difference is not None else None,
+                "current_units": str(current_units) if current_units is not None else None,
+                "current_as_of_date": current_date,
+                "current_source": current_source,
+            })
+        return {
+            "events": [share_event_result(session, event) for event in events],
+            "positions": position_rows,
+            "snapshots": [
+                {
+                    **row(snapshot),
+                    "units": str(snapshot.units),
+                    "product_name": session.get(Product, snapshot.product_id).name,
+                    "share_name": session.get(ShareClass, snapshot.share_id).name
+                    if snapshot.share_id else None,
+                }
+                for snapshot in snapshots
+            ],
+        }
+
+    def create_share_review_task(session, event, reason, details=None):
+        return task(
+            session,
+            event.manager_id,
+            "investor_share",
+            f"investor_share:{event.id}",
+            {
+                "share_event_id": event.id,
+                "investor_id": event.investor_id,
+                "source_mail_item_id": event.source_mail_item_id,
+                "document_id": event.source_document_id,
+                "reason": reason,
+                **(details or {}),
+            },
+            event.product_id,
+            event.share_id,
+            share_event_date(event) or None,
+        )
+
+    def resolve_share_review_tasks(session, event, actor, reason):
+        issues = list(session.scalars(select(ExceptionTask).where(
+            ExceptionTask.manager_id == event.manager_id,
+            ExceptionTask.kind == "investor_share",
+            ExceptionTask.status != "resolved",
+        )))
+        for issue in issues:
+            if issue.payload.get("share_event_id") != event.id:
+                continue
+            issue.status = "resolved"
+            issue.updated_at = now()
+            issue.revision += 1
+            issue.resolution = {
+                "via": "investor_share_status",
+                "share_event_id": event.id,
+                "status": event.status,
+                "reason": reason,
+            }
+            audit(
+                session,
+                actor,
+                issue.manager_id,
+                "exception.investor_share_resolved",
+                issue.id,
+                issue.resolution,
+            )
+
+    def update_snapshot_review_tasks(session, snapshot, actor, difference):
+        for issue in session.scalars(select(ExceptionTask).where(
+            ExceptionTask.manager_id == snapshot.manager_id,
+            ExceptionTask.kind == "investor_share",
+            ExceptionTask.product_id == snapshot.product_id,
+            ExceptionTask.status != "resolved",
+        )):
+            if (
+                issue.payload.get("reason") != "position_difference"
+                or issue.payload.get("investor_id") != snapshot.investor_id
+                or issue.payload.get("share_id") != snapshot.share_id
+            ):
+                continue
+            issue.status = "resolved"
+            issue.updated_at = now()
+            issue.revision += 1
+            issue.resolution = {
+                "via": "new_position_snapshot",
+                "snapshot_id": snapshot.id,
+                "as_of_date": snapshot.as_of_date,
+            }
+            audit(
+                session,
+                actor,
+                issue.manager_id,
+                "exception.investor_share_snapshot_superseded",
+                issue.id,
+                issue.resolution,
+            )
+        if difference is None or difference == 0:
+            return None
+        return task(
+            session,
+            snapshot.manager_id,
+            "investor_share",
+            f"investor_share_snapshot:{snapshot.id}",
+            {
+                "snapshot_id": snapshot.id,
+                "investor_id": snapshot.investor_id,
+                "share_id": snapshot.share_id,
+                "source_mail_item_id": snapshot.source_mail_item_id,
+                "document_id": snapshot.source_document_id,
+                "reason": "position_difference",
+                "message": "托管份额快照与同日确认后份额不一致。",
+                "difference": str(difference),
+                "as_of_date": snapshot.as_of_date,
+            },
+            snapshot.product_id,
+            snapshot.share_id,
+            snapshot.as_of_date,
+        )
+
     def get_issue(session, actor, issue_id):
         issue = session.get(ExceptionTask, issue_id)
         if not issue:
             raise HTTPException(404, "待办不存在")
-        require(session, actor, issue.manager_id, "member")
+        permissions = require(session, actor, issue.manager_id, "member")
+        if issue.kind == "investor_share" and not permissions["investor_read"]:
+            raise HTTPException(403, "没有投资者份额异常的查看权限")
         return issue
+
+    def mail_document_ids(session, mail_item):
+        document_ids = {mail_item.document_id}
+        parents = [mail_item.document_id]
+        while parents:
+            children = list(
+                session.scalars(
+                    select(Document.id).where(Document.parent_id.in_(parents))
+                )
+            )
+            parents = [
+                document_id
+                for document_id in children
+                if document_id not in document_ids
+            ]
+            document_ids.update(parents)
+        return document_ids
+
+    def settle_mail_exceptions(
+        session,
+        actor,
+        mail_item,
+        disposition,
+        reason,
+        primary_issue_id=None,
+    ):
+        document_ids = mail_document_ids(session, mail_item)
+        for job in session.scalars(
+            select(ParseJob).where(
+                ParseJob.document_id.in_(document_ids),
+                ParseJob.status.in_(["queued", "review", "skipped"]),
+            )
+        ):
+            job.status = "skipped"
+            job.updated_at = now()
+            job.result = {
+                **(job.result or {}),
+                "reason": "邮件已由运营人员判定无需继续解析",
+                "mail_disposition": disposition,
+            }
+
+        resolved = 0
+        open_issues = list(
+            session.scalars(
+                select(ExceptionTask).where(
+                    ExceptionTask.manager_id == mail_item.manager_id,
+                    ExceptionTask.status != "resolved",
+                )
+            )
+        )
+        for linked_issue in open_issues:
+            related = linked_issue.payload.get("document_id") in document_ids
+            record_ids = linked_issue.payload.get("record_ids", [])
+            if record_ids and not related:
+                related = bool(
+                    session.scalar(
+                        select(NavRecord.id)
+                        .where(
+                            NavRecord.id.in_(record_ids),
+                            NavRecord.document_id.in_(document_ids),
+                        )
+                        .limit(1)
+                    )
+                )
+            if linked_issue.id != primary_issue_id and (
+                linked_issue.kind not in {"parse", "validation"} or not related
+            ):
+                continue
+            if linked_issue.id == primary_issue_id or related:
+                linked_issue.status = "resolved"
+                linked_issue.updated_at = now()
+                linked_issue.revision += 1
+                linked_issue.resolution = {
+                    "via": "mail_disposition",
+                    "disposition": disposition,
+                    "reason": reason,
+                    "mail_item_id": mail_item.id,
+                    "actor_id": actor.id,
+                    "at": now(),
+                }
+                audit(
+                    session,
+                    actor,
+                    linked_issue.manager_id,
+                    "exception.mail_disposition_resolved",
+                    linked_issue.id,
+                    linked_issue.resolution,
+                )
+                resolved += 1
+        return resolved
 
     def issue_row(session, issue):
         item = row(issue)
@@ -511,8 +960,34 @@ def create_app(settings=None):
         )
         item["candidates"] = [row(candidate) for candidate in candidates]
 
+        if issue.kind == "investor_share":
+            investor = session.get(Investor, issue.payload.get("investor_id"))
+            event_id = issue.payload.get("share_event_id")
+            snapshot_id = issue.payload.get("snapshot_id")
+            event = session.get(InvestorShareEvent, event_id) if event_id else None
+            snapshot = (
+                session.get(InvestorPositionSnapshot, snapshot_id)
+                if snapshot_id else None
+            )
+            item["investor_name"] = investor.display_name if investor else None
+            item["investor_share_event"] = (
+                share_event_result(session, event) if event else None
+            )
+            item["investor_position_snapshot"] = (
+                {
+                    **row(snapshot),
+                    "units": str(snapshot.units),
+                    "product_name": session.get(Product, snapshot.product_id).name,
+                    "share_name": session.get(ShareClass, snapshot.share_id).name
+                    if snapshot.share_id else None,
+                }
+                if snapshot else None
+            )
+
         document_ids = [issue.payload.get("document_id")]
-        document_ids.extend(candidate.document_id for candidate in candidates)
+        # Conflicts usually arise from the newest delivery, so link the exception
+        # to that mail before older candidate sources.
+        document_ids.extend(candidate.document_id for candidate in reversed(candidates))
         if issue.payload.get("expectation_id"):
             expectation = session.get(
                 ReceiptExpectation, issue.payload["expectation_id"]
@@ -521,8 +996,13 @@ def create_app(settings=None):
                 document_ids.append(expectation.document_id)
 
         mail_item = None
+        direct_mail_item_id = issue.payload.get("source_mail_item_id")
+        if direct_mail_item_id:
+            direct_mail_item = session.get(MailItem, direct_mail_item_id)
+            if direct_mail_item and direct_mail_item.manager_id == issue.manager_id:
+                mail_item = direct_mail_item
         visited = set()
-        for document_id in filter(None, document_ids):
+        for document_id in (filter(None, document_ids) if not mail_item else ()):
             document = session.get(Document, document_id)
             while document and document.id not in visited:
                 visited.add(document.id)
@@ -1417,6 +1897,305 @@ def create_app(settings=None):
             ),
         )
 
+    @app.get("/api/investors/{investor_id}/share-events")
+    def investor_share_events(
+        investor_id: str,
+        product_id: str | None = None,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        investor = session.get(Investor, investor_id)
+        if not investor:
+            raise HTTPException(404, "投资者记录不存在")
+        require(session, actor, investor.manager_id, "investor_read")
+        if product_id:
+            product = session.get(Product, product_id)
+            if not product or product.manager_id != investor.manager_id:
+                raise HTTPException(422, "筛选产品不存在或不属于当前牌照")
+        return share_ledger_result(session, investor, product_id)
+
+    @app.get("/api/products/{product_id}/investor-shares")
+    def product_investor_shares(
+        product_id: str,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        product = session.get(Product, product_id)
+        if not product:
+            raise HTTPException(404, "产品不存在")
+        require(session, actor, product.manager_id, "investor_read")
+        records = list(session.scalars(
+            select(Investor)
+            .join(InvestorProduct, InvestorProduct.investor_id == Investor.id)
+            .where(
+                InvestorProduct.product_id == product.id,
+                Investor.manager_id == product.manager_id,
+            )
+            .order_by(Investor.display_name, Investor.created_at)
+        ))
+        return {
+            "product": {"id": product.id, "name": product.name, "code": product.code},
+            "investors": [
+                {
+                    "investor": {
+                        "id": investor.id,
+                        "display_name": investor.display_name,
+                        "investor_type": investor.investor_type,
+                        "suitability_class": investor.suitability_class,
+                        "status": investor.status,
+                    },
+                    "ledger": share_ledger_result(session, investor, product.id),
+                }
+                for investor in records
+            ],
+        }
+
+    @app.post("/api/investors/{investor_id}/share-events", status_code=201)
+    def create_investor_share_event(
+        investor_id: str,
+        data: S.InvestorShareEventCreate,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        investor = session.get(Investor, investor_id)
+        if not investor:
+            raise HTTPException(404, "投资者记录不存在")
+        require(session, actor, investor.manager_id, "investor_write")
+        product, share, mail_item, document, supersedes = share_event_context(
+            session, investor, data.product_id, data.share_id,
+            data.source_mail_item_id, data.source_document_id,
+            data.supersedes_event_id,
+        )
+        requested_amount = share_decimal(data.requested_amount, "申请金额")
+        confirmed_amount = share_decimal(data.confirmed_amount, "确认金额")
+        units_delta = share_decimal(data.units_delta, "份额变动")
+        unit_nav = share_decimal(data.unit_nav, "确认净值", 8)
+        fee_amount = share_decimal(data.fee_amount, "手续费")
+        balance_after = share_decimal(data.balance_after, "确认后份额")
+        if data.event_type in {"redemption", "full_redemption"} and units_delta is not None and units_delta > 0:
+            raise HTTPException(422, "赎回的份额变动应填写负数")
+        if data.business_ref:
+            duplicate = session.scalar(select(InvestorShareEvent).where(
+                InvestorShareEvent.manager_id == investor.manager_id,
+                InvestorShareEvent.investor_id == investor.id,
+                InvestorShareEvent.product_id == product.id,
+                InvestorShareEvent.business_ref == data.business_ref,
+                InvestorShareEvent.status != "void",
+            ))
+            if duplicate:
+                raise HTTPException(409, "相同投资者、产品和业务编号的份额记录已经存在")
+        elif mail_item:
+            duplicate = session.scalar(select(InvestorShareEvent).where(
+                InvestorShareEvent.investor_id == investor.id,
+                InvestorShareEvent.product_id == product.id,
+                InvestorShareEvent.share_id == (share.id if share else None),
+                InvestorShareEvent.event_type == data.event_type,
+                InvestorShareEvent.source_mail_item_id == mail_item.id,
+                InvestorShareEvent.status != "void",
+            ))
+            if duplicate:
+                raise HTTPException(409, "这封邮件中相同投资者、产品和业务类型已经整理过")
+        elif data.evidence_stage == "confirmation" and (units_delta is not None or confirmed_amount is not None):
+            duplicate = session.scalar(select(InvestorShareEvent).where(
+                InvestorShareEvent.investor_id == investor.id,
+                InvestorShareEvent.product_id == product.id,
+                InvestorShareEvent.share_id == (share.id if share else None),
+                InvestorShareEvent.event_type == data.event_type,
+                InvestorShareEvent.confirmation_date == (
+                    data.confirmation_date.isoformat() if data.confirmation_date else None
+                ),
+                InvestorShareEvent.units_delta == units_delta,
+                InvestorShareEvent.confirmed_amount == confirmed_amount,
+                InvestorShareEvent.status != "void",
+            ))
+            if duplicate:
+                raise HTTPException(409, "相同确认日、金额和份额的记录已经存在，请核对是否为重复材料")
+        timestamp = now()
+        auto_confirmed = bool(
+            data.evidence_stage == "confirmation"
+            and mail_item
+            and (units_delta is not None or balance_after is not None)
+            and (data.confirmation_date or data.effective_date)
+        )
+        event_status = (
+            "confirmed"
+            if auto_confirmed
+            else "pending"
+            if data.evidence_stage == "confirmation"
+            else "archived"
+        )
+        event = InvestorShareEvent(
+            manager_id=investor.manager_id,
+            investor_id=investor.id,
+            product_id=product.id,
+            share_id=share.id if share else None,
+            event_type=data.event_type,
+            evidence_stage=data.evidence_stage,
+            status=event_status,
+            application_date=data.application_date.isoformat() if data.application_date else None,
+            confirmation_date=data.confirmation_date.isoformat() if data.confirmation_date else None,
+            effective_date=data.effective_date.isoformat() if data.effective_date else None,
+            requested_amount=requested_amount,
+            confirmed_amount=confirmed_amount,
+            units_delta=units_delta,
+            unit_nav=unit_nav,
+            fee_amount=fee_amount,
+            balance_after=balance_after,
+            business_ref=data.business_ref,
+            source_mail_item_id=mail_item.id if mail_item else None,
+            source_document_id=document.id if document else None,
+            supersedes_event_id=supersedes.id if supersedes else None,
+            notes=data.notes,
+            created_by=actor.id,
+            confirmed_by=actor.id if auto_confirmed else None,
+            created_at=timestamp,
+            updated_at=timestamp,
+            confirmed_at=timestamp if auto_confirmed else None,
+        )
+        session.add(event)
+        ensure_investor_product(session, actor, investor, product.id)
+        link_share_source_material(
+            session, actor, investor, product.id, document,
+            data.event_type, data.evidence_stage,
+        )
+        session.flush()
+        complete_share_mail_action(session, mail_item, "share_event", event.id)
+        if event.status == "pending":
+            create_share_review_task(
+                session,
+                event,
+                "confirmation_incomplete" if mail_item else "source_mail_missing",
+                {
+                    "message": "正式确认信息缺少可自动入账的数据或邮件依据，请核对来源。",
+                    "missing_units": units_delta is None and balance_after is None,
+                    "missing_mail": mail_item is None,
+                },
+            )
+        audit(session, actor, investor.manager_id, "investor_share_event.created", event.id, {
+            "investor_id": investor.id,
+            "product_id": product.id,
+            "share_id": event.share_id,
+            "event_type": event.event_type,
+            "evidence_stage": event.evidence_stage,
+            "status": event.status,
+            "source_mail_item_id": event.source_mail_item_id,
+            "source_document_id": event.source_document_id,
+            "supersedes_event_id": event.supersedes_event_id,
+            "auto_confirmed": auto_confirmed,
+        })
+        return share_event_result(session, event)
+
+    @app.put("/api/investor-share-events/{event_id}/status")
+    def update_investor_share_event_status(
+        event_id: str,
+        data: S.InvestorShareEventStatus,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        event = session.scalar(select(InvestorShareEvent).where(
+            InvestorShareEvent.id == event_id
+        ).with_for_update())
+        if not event:
+            raise HTTPException(404, "份额记录不存在")
+        require(session, actor, event.manager_id, "investor_write")
+        if event.revision != data.revision:
+            raise HTTPException(409, "份额记录已经变化，请刷新后重试")
+        if event.status in {"void", "confirmed"}:
+            raise HTTPException(409, "已确认或已作废的记录不能直接改写，请新增更正记录")
+        if data.status == "confirmed":
+            if event.evidence_stage != "confirmation":
+                raise HTTPException(422, "只有正式确认材料才能计入持仓")
+            if event.units_delta is None and event.balance_after is None:
+                raise HTTPException(422, "确认入账前必须填写份额变动或确认后份额")
+        before = event.status
+        event.status = data.status
+        event.updated_at = now()
+        event.revision += 1
+        if data.status == "confirmed":
+            event.confirmed_by = actor.id
+            event.confirmed_at = event.updated_at
+        event.notes = (event.notes + "\n" if event.notes else "") + data.reason
+        resolve_share_review_tasks(session, event, actor, data.reason)
+        audit(session, actor, event.manager_id, "investor_share_event.status_changed", event.id, {
+            "before": before,
+            "after": event.status,
+            "reason": data.reason,
+            "revision": event.revision,
+        })
+        return share_event_result(session, event)
+
+    @app.post("/api/investors/{investor_id}/position-snapshots", status_code=201)
+    def create_investor_position_snapshot(
+        investor_id: str,
+        data: S.InvestorPositionSnapshotCreate,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        investor = session.get(Investor, investor_id)
+        if not investor:
+            raise HTTPException(404, "投资者记录不存在")
+        require(session, actor, investor.manager_id, "investor_write")
+        product, share, mail_item, document, _ = share_event_context(
+            session, investor, data.product_id, data.share_id,
+            data.source_mail_item_id, data.source_document_id,
+        )
+        snapshot = InvestorPositionSnapshot(
+            manager_id=investor.manager_id,
+            investor_id=investor.id,
+            product_id=product.id,
+            share_id=share.id if share else None,
+            as_of_date=data.as_of_date.isoformat(),
+            units=share_decimal(data.units, "持仓份额"),
+            source_mail_item_id=mail_item.id if mail_item else None,
+            source_document_id=document.id if document else None,
+            notes=data.notes,
+            created_by=actor.id,
+            created_at=now(),
+        )
+        session.add(snapshot)
+        ensure_investor_product(session, actor, investor, product.id)
+        link_share_source_material(
+            session, actor, investor, product.id, document,
+            "adjustment", "snapshot",
+        )
+        try:
+            session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(409, "相同日期和来源的持仓快照已经存在") from exc
+        complete_share_mail_action(session, mail_item, "position_snapshot", snapshot.id)
+        same_day_event = session.scalar(
+            select(InvestorShareEvent)
+            .where(
+                InvestorShareEvent.investor_id == investor.id,
+                InvestorShareEvent.product_id == product.id,
+                InvestorShareEvent.share_id == snapshot.share_id,
+                InvestorShareEvent.status == "confirmed",
+                InvestorShareEvent.balance_after.is_not(None),
+                or_(
+                    InvestorShareEvent.effective_date == snapshot.as_of_date,
+                    InvestorShareEvent.confirmation_date == snapshot.as_of_date,
+                ),
+            )
+            .order_by(InvestorShareEvent.created_at.desc())
+            .limit(1)
+        )
+        snapshot_difference = (
+            snapshot.units - same_day_event.balance_after if same_day_event else None
+        )
+        update_snapshot_review_tasks(
+            session, snapshot, actor, snapshot_difference
+        )
+        audit(session, actor, investor.manager_id, "investor_position_snapshot.created", snapshot.id, {
+            "investor_id": investor.id,
+            "product_id": product.id,
+            "share_id": snapshot.share_id,
+            "as_of_date": snapshot.as_of_date,
+            "source_mail_item_id": snapshot.source_mail_item_id,
+            "source_document_id": snapshot.source_document_id,
+            "difference": str(snapshot_difference) if snapshot_difference is not None else None,
+        })
+        return {**row(snapshot), "units": str(snapshot.units)}
+
     @app.post("/api/investors/{investor_id}/bank-accounts", status_code=201)
     def create_investor_bank_account(
         investor_id: str,
@@ -1606,6 +2385,7 @@ def create_app(settings=None):
                 ),
                 sensitivity="investor_sensitive" if is_investor_material else "standard",
                 status="pending",
+                organization_source="manual",
                 confirmed_by=actor.id,
                 confirmed_at=timestamp,
                 created_at=timestamp,
@@ -2107,6 +2887,7 @@ def create_app(settings=None):
         material.notes = data.notes
         material.sensitivity = data.sensitivity
         material.status = "organized"
+        material.organization_source = "manual"
         material.confirmed_by = actor.id
         material.confirmed_at = timestamp
         material.updated_at = timestamp
@@ -2326,12 +3107,14 @@ def create_app(settings=None):
     def tasks(
         manager_id: str, actor=Depends(user), session=Depends(db, scope="function")
     ):
-        require(session, actor, manager_id, "member")
+        permissions = require(session, actor, manager_id, "member")
         query = (
             select(ExceptionTask)
             .where(ExceptionTask.manager_id == manager_id)
             .order_by(ExceptionTask.created_at.desc())
         )
+        if not permissions["investor_read"]:
+            query = query.where(ExceptionTask.kind != "investor_share")
         active = list(session.scalars(query.where(ExceptionTask.status != "resolved")))
         recent = list(
             session.scalars(query.where(ExceptionTask.status == "resolved").limit(100))
@@ -2427,6 +3210,77 @@ def create_app(settings=None):
             data.revision,
         )
         return {"ok": True}
+
+    @app.post("/api/tasks/{issue_id}/mail-disposition")
+    def mail_disposition(
+        issue_id: str,
+        data: S.ExceptionMailDisposition,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        initial = get_issue(session, actor, issue_id)
+        require(session, actor, initial.manager_id, "write")
+        issue = session.scalar(
+            select(ExceptionTask)
+            .where(ExceptionTask.id == issue_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if issue.status == "resolved" or issue.revision != data.revision:
+            raise HTTPException(409, "待办已更新，请刷新后处理")
+        linked = issue_row(session, issue)
+        mail_item = (
+            session.get(MailItem, linked["mail_item_id"])
+            if linked.get("mail_item_id")
+            else None
+        )
+        if not mail_item or mail_item.manager_id != issue.manager_id:
+            raise HTTPException(422, "该异常没有可处理的邮件来源")
+        if mail_item.category == "investor_redemption":
+            require(session, actor, issue.manager_id, "investor_write")
+
+        labels = {
+            "notification": "仅作通知",
+            "duplicate": "重复邮件",
+            "void": "误发或作废",
+        }
+        before = {
+            "category": mail_item.category,
+            "handling_mode": mail_item.handling_mode,
+            "status": mail_item.status,
+        }
+        apply_manual_classification(
+            session,
+            mail_item,
+            "other" if data.disposition == "notification" else mail_item.category,
+            "archive",
+            None,
+        )
+        mail_item.status = "completed"
+        mail_item.classification_source = f"manual_{data.disposition}"
+        settled = settle_mail_exceptions(
+            session,
+            actor,
+            mail_item,
+            data.disposition,
+            data.reason,
+            issue.id,
+        )
+        audit(
+            session,
+            actor,
+            issue.manager_id,
+            "mail_item.disposition_set",
+            mail_item.id,
+            {
+                "before": before,
+                "disposition": data.disposition,
+                "label": labels[data.disposition],
+                "reason": data.reason,
+                "resolved_exceptions": settled,
+            },
+        )
+        return {"ok": True, "resolved_exceptions": settled}
 
     @app.post("/api/tasks/{issue_id}/complete-material")
     def complete_material(
@@ -2801,6 +3655,7 @@ def create_app(settings=None):
                     "action": row(actions.get(item.id)),
                     "products": product_map[item.id],
                     "sources": source_map[item.document_id],
+                    "receipt_count": len(source_map[item.document_id]),
                     "attachment_count": attachment_counts.get(item.document_id, 0),
                 }
             )
@@ -2980,6 +3835,18 @@ def create_app(settings=None):
             data.handling_mode,
             data.suggested_action,
         )
+        parse_candidate = (
+            data.category == "nav_valuation" and data.handling_mode != "archive"
+        )
+        resolved_exceptions = 0
+        if not parse_candidate:
+            resolved_exceptions = settle_mail_exceptions(
+                session,
+                actor,
+                item,
+                "classification",
+                "邮件人工分类后不再作为净值材料解析",
+            )
         audit(
             session,
             actor,
@@ -2993,6 +3860,7 @@ def create_app(settings=None):
                     "handling_mode": item.handling_mode,
                     "status": item.status,
                 },
+                "resolved_exceptions": resolved_exceptions,
             },
         )
         return {"ok": True, "revision": item.revision}

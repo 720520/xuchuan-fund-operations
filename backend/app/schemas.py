@@ -165,6 +165,11 @@ class MailClassification(Revision):
     suggested_action: str | None = Field(default=None, max_length=500)
 
 
+class ExceptionMailDisposition(Revision):
+    disposition: Literal["notification", "duplicate", "void"]
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 class RuleInput(Strict):
     max_nav_change: str | None = Field(default=None, max_length=20)
 
@@ -219,6 +224,9 @@ class MaterialOrganization(Strict):
         "supplemental_agreement",
         "subscription_form",
         "redemption_form",
+        "share_confirmation",
+        "position_statement",
+        "dividend_notice",
         "double_recording",
         "cooling_off_callback",
         "transfer_voucher",
@@ -327,3 +335,57 @@ class InvestorBankAccountSave(Strict):
         if any(not item for item in value) or len(set(value)) != len(value):
             raise ValueError("账户关联产品不能为空或重复")
         return value
+
+
+class InvestorShareEventCreate(Strict):
+    product_id: str
+    share_id: str | None = None
+    event_type: Literal[
+        "subscription",
+        "additional_subscription",
+        "redemption",
+        "full_redemption",
+        "cash_dividend",
+        "dividend_reinvestment",
+        "transfer",
+        "adjustment",
+    ]
+    evidence_stage: Literal["notice", "application", "accepted", "confirmation"] = "notice"
+    application_date: date | None = None
+    confirmation_date: date | None = None
+    effective_date: date | None = None
+    requested_amount: str | None = Field(default=None, max_length=60)
+    confirmed_amount: str | None = Field(default=None, max_length=60)
+    units_delta: str | None = Field(default=None, max_length=60)
+    unit_nav: str | None = Field(default=None, max_length=60)
+    fee_amount: str | None = Field(default=None, max_length=60)
+    balance_after: str | None = Field(default=None, max_length=60)
+    business_ref: str | None = Field(default=None, max_length=150)
+    source_mail_item_id: str | None = None
+    source_document_id: str | None = None
+    supersedes_event_id: str | None = None
+    notes: str = Field(default="", max_length=2000)
+
+    @model_validator(mode="after")
+    def valid_share_event(self):
+        if self.evidence_stage == "confirmation" and not (
+            self.confirmation_date or self.effective_date
+        ):
+            raise ValueError("确认材料需要填写确认日或生效日")
+        return self
+
+
+class InvestorShareEventStatus(Strict):
+    revision: int = Field(ge=1)
+    status: Literal["confirmed", "archived", "void"]
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class InvestorPositionSnapshotCreate(Strict):
+    product_id: str
+    share_id: str | None = None
+    as_of_date: date
+    units: str = Field(min_length=1, max_length=60)
+    source_mail_item_id: str | None = None
+    source_document_id: str | None = None
+    notes: str = Field(default="", max_length=2000)

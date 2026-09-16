@@ -7,7 +7,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from app.mail_sync import ingest_message
-from app.models import Document, Mailbox, NavRecord, ParseJob, ProductGrant
+from app.models import (
+    Document,
+    DocumentMaterial,
+    DocumentMaterialProduct,
+    Mailbox,
+    NavRecord,
+    ParseJob,
+    ProductGrant,
+)
 from app.parsing import parse
 from app.services import refresh_missing
 from app.worker import run_once
@@ -163,6 +171,11 @@ def test_upload_parse_durable_idempotent_and_download_scope(env):
     docs = client.get(f"/api/managers/{ids['a']}/documents").json()
     assert docs[0]["job"]["status"] == "completed"
     assert len(docs[0]["job"]["result"]["record_ids"]) == 1
+    assert docs[0]["material_status"] == "organized"
+    assert docs[0]["organization_source"] == "system_parse"
+    assert docs[0]["category"] == "nav_valuation"
+    assert docs[0]["business_date"] == "2026-08-28"
+    assert docs[0]["product_ids"] == [p["id"]]
     history = client.get(
         f"/api/products/{p['id']}/nav", params={"share_id": p["shares"][0]["id"]}
     ).json()
@@ -174,6 +187,14 @@ def test_upload_parse_durable_idempotent_and_download_scope(env):
     run_once(app.state.factory, app.state.settings)
     with app.state.factory() as db:
         assert len(list(db.scalars(select(NavRecord)))) == 1
+        material = db.get(DocumentMaterial, doc["id"])
+        assert material.confirmed_by is None
+        assert material.organization_source == "system_parse"
+        assert db.scalar(
+            select(DocumentMaterialProduct.product_id).where(
+                DocumentMaterialProduct.document_id == doc["id"]
+            )
+        ) == p["id"]
     login(client, "colleague")
     assert client.get(f"/api/documents/{doc['id']}/download").status_code == 403
     login(client, "otherops")
@@ -181,6 +202,37 @@ def test_upload_parse_durable_idempotent_and_download_scope(env):
     assert client.get(f"/api/documents/{doc['id']}/download").status_code == 403
     with pytest.raises(DBAPIError), app.state.engine.begin() as c:
         c.execute(text("DELETE FROM documents"))
+
+
+def test_completed_nav_materials_are_backfilled_after_deployment(env):
+    app, client, ids = env
+    login(client)
+    p = product(client, ids["a"], "BACKFILL")
+    document = client.post(
+        f"/api/managers/{ids['a']}/documents",
+        files={"file": ("历史净值附件.bin", b"legacy-parsed-document")},
+    ).json()
+    record = client.post(
+        f"/api/managers/{ids['a']}/nav",
+        json=nav_data(p, day="2026-08-27"),
+    ).json()
+    with app.state.factory.begin() as db:
+        job = db.scalar(
+            select(ParseJob).where(ParseJob.document_id == document["id"])
+        )
+        job.status = "completed"
+        job.result = {"record_ids": [record["id"]], "errors": []}
+
+    run_once(app.state.factory, app.state.settings)
+    listed = client.get(
+        f"/api/managers/{ids['a']}/documents",
+        params={"paginated": "true", "status": "pending"},
+    ).json()
+    assert document["id"] not in {item["id"] for item in listed["items"]}
+    with app.state.factory() as db:
+        material = db.get(DocumentMaterial, document["id"])
+        assert material.organization_source == "system_parse"
+        assert material.business_date == "2026-08-27"
 
 
 def test_unknown_product_can_be_created_then_reparsed(env):

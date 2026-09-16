@@ -4,11 +4,18 @@ import { useResource, mailCategoryLabel, timestamp, type MailItem, type Mailbox 
 import { Button } from "./components/ui/button";
 
 type MailPage = { items: MailItem[]; total: number; offset: number; limit: number };
-export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, target, renderDetail, onAction, onClassify }: {
-  base: string; boxes: Mailbox[]; boxesError?: string; revision: number; canWrite: boolean;
+function dispositionLabel(source: string) {
+  return ({
+    manual_notification: "仅作通知",
+    manual_duplicate: "重复邮件",
+    manual_void: "误发 / 作废",
+  } as Record<string, string>)[source];
+}
+export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, canManageShares, target, renderDetail, onAction, onClassify, onShareEvent, onPositionSnapshot }: {
+  base: string; boxes: Mailbox[]; boxesError?: string; revision: number; canWrite: boolean; canManageShares: boolean;
   target?: { itemId: string; request: number } | null;
   renderDetail: (item: MailItem) => ReactNode;
-  onAction: (item: MailItem) => void; onClassify: (item: MailItem) => void;
+  onAction: (item: MailItem) => void; onClassify: (item: MailItem) => void; onShareEvent: (item: MailItem) => void; onPositionSnapshot: (item: MailItem) => void;
 }) {
   const [mailbox, setMailbox] = useState("");
   const [filter, setFilter] = useState("all");
@@ -57,8 +64,8 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, tar
           <span className="mail-row-sender">{entry.sender || "发件人未提供"}</span>
           <strong>{entry.title || "（无主题）"}</strong>
           <span className="mail-row-excerpt">{entry.excerpt || "暂无正文摘要"}</span>
-          <span className="mail-row-foot"><time>{timestamp(entry.created_at)}</time>{entry.attachment_count > 0 && <span><Paperclip size={12} />{entry.attachment_count}</span>}</span>
-          <small>{mailCategoryLabel(entry.category)}{entry.action?.status === "open" ? " · 待处理" : ""}</small>
+          <span className="mail-row-foot"><time>{timestamp(entry.created_at)}</time>{entry.attachment_count > 0 && <span><Paperclip size={12} />{entry.attachment_count}</span>}{entry.receipt_count > 1 && <span>接收 {entry.receipt_count} 次</span>}</span>
+          <small>{mailCategoryLabel(entry.category)}{dispositionLabel(entry.classification_source) ? ` · ${dispositionLabel(entry.classification_source)}` : entry.action?.status === "open" ? " · 待处理" : ""}</small>
         </button>)}
         {!items.length && !state.error && <p className="mail-list-note">{state.loading ? "正在读取邮件…" : "当前范围暂无邮件"}</p>}
       </div>
@@ -71,9 +78,11 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, tar
     <article className="mail-reading-pane" aria-label="邮件正文与附件">
       {currentBox && <div className="mail-current-source">{currentBox.label} · 最近同步 {timestamp(currentBox.last_sync)}{currentBox.error && <p role="alert">{currentBox.error}</p>}</div>}
       {item ? <>
-        {canWrite && (item.action?.status === "open" || item.status === "pending") && <div className="mail-reading-actions">
-          {item.action?.status === "open" && <><span>{item.action.suggested_action}</span><Button variant="outline" onClick={() => onAction(item)}>处理待办</Button></>}
-          {item.status === "pending" && <Button variant="outline" onClick={() => onClassify(item)}>确认分类</Button>}
+        {((canWrite && (item.action?.status === "open" || item.status === "pending")) || (canManageShares && item.category === "investor_redemption")) && <div className="mail-reading-actions">
+          {canWrite && item.action?.status === "open" && <><span>{item.action.suggested_action}</span><Button variant="outline" onClick={() => onAction(item)}>处理待办</Button></>}
+          {canWrite && item.status === "pending" && <Button variant="outline" onClick={() => onClassify(item)}>确认分类</Button>}
+          {canManageShares && item.category === "investor_redemption" && <Button onClick={() => onShareEvent(item)}>整理份额信息</Button>}
+          {canManageShares && item.category === "investor_redemption" && <Button variant="ghost" onClick={() => onPositionSnapshot(item)}>登记持仓快照</Button>}
         </div>}
         {renderDetail(item)}
       </> : <p className="mail-list-note">{state.loading ? "正在读取…" : "选择邮件后在此阅读正文和附件"}</p>}
