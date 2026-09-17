@@ -131,6 +131,7 @@ button:disabled {
   display: grid;
   grid-template-columns: 1.65fr 1fr;
   gap: 24px;
+  align-items: start;
 }
 .panel {
   background: var(--card);

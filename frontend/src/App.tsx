@@ -888,8 +888,12 @@ function Workspace({
     [showHiddenProducts, setShowHiddenProducts] = useState(false),
     [selectedProduct, setSelectedProduct] = useState(""),
     [selectedShare, setSelectedShare] = useState(""),
+    [overviewNavPage, setOverviewNavPage] = useState(0),
+    [overviewNavPageSize, setOverviewNavPageSize] = useState(8),
     [period, setPeriod] = useState("all");
   const [checkDate, setCheckDate] = useState("");
+  const overviewNavPanelRef = useRef<HTMLElement | null>(null);
+  const overviewSideRef = useRef<HTMLDivElement | null>(null);
   const manager = me.managers.find((m) => m.id === managerId),
     perm = manager?.permissions;
   const base = manager ? `/managers/${manager.id}` : null;
@@ -1033,6 +1037,7 @@ function Workspace({
     setMaterialSensitivity("");
     setInvestorMaterialScope("all");
     setMaterialPage(0);
+    setOverviewNavPage(0);
     setShowHiddenProducts(false);
     setFeedback("");
     setView("overview");
@@ -1456,6 +1461,70 @@ function Workspace({
     );
   }
   const shares = products.flatMap((product) => product.shares.map((s) => ({ ...s, product })));
+  const productsWithoutShares = products.filter((product) => !product.shares.length);
+  const overviewNavRows = products.flatMap((product) =>
+    product.shares.length
+      ? product.shares.map((share) => ({
+          id: share.id,
+          name: share.name,
+          latest: share.latest,
+          product,
+          missingShare: false,
+        }))
+      : [{
+          id: `product:${product.id}`,
+          name: "份额待建立",
+          latest: null,
+          product,
+          missingShare: true,
+        }],
+  );
+  const overviewNavPageCount = Math.max(1, Math.ceil(overviewNavRows.length / overviewNavPageSize));
+  const effectiveOverviewNavPage = Math.min(overviewNavPage, overviewNavPageCount - 1);
+  const visibleOverviewNavRows = overviewNavRows.slice(
+    effectiveOverviewNavPage * overviewNavPageSize,
+    (effectiveOverviewNavPage + 1) * overviewNavPageSize,
+  );
+  useEffect(() => {
+    if (view !== "overview" || !overviewNavRows.length) return;
+    const panel = overviewNavPanelRef.current;
+    const side = overviewSideRef.current;
+    if (!panel || !side) return;
+    let frame = 0;
+    const measure = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const rows = Array.from(
+          panel.querySelectorAll<HTMLElement>('[data-slot="table-body"] [data-slot="table-row"]'),
+        );
+        if (!rows.length) return;
+        const rowsHeight = rows.reduce(
+          (total, row) => total + row.getBoundingClientRect().height,
+          0,
+        );
+        const averageRowHeight = rowsHeight / rows.length;
+        if (!averageRowHeight) return;
+        const fixedPanelHeight = panel.getBoundingClientRect().height - rowsHeight;
+        const availableRows = Math.max(
+          4,
+          Math.floor((side.getBoundingClientRect().height - fixedPanelHeight) / averageRowHeight),
+        );
+        const nextPageSize = Math.min(overviewNavRows.length, 12, availableRows);
+        if (nextPageSize !== overviewNavPageSize) {
+          setOverviewNavPage(0);
+          setOverviewNavPageSize(nextPageSize);
+        }
+      });
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(panel);
+    observer.observe(side);
+    measure();
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [managerId, overviewNavPageSize, overviewNavRows.length, pending.length, view]);
   const allSeries = history?.series || [];
   const cutoff =
     period === "all"
@@ -1671,7 +1740,9 @@ function Workspace({
                         {shares.filter((s) => s.latest).length}
                         <small>/ {shares.length} 类份额</small>
                       </strong>
-                      <p>按各份额独立记录</p>
+                      <p>{productsWithoutShares.length > 0
+                        ? `${productsWithoutShares.length} 只产品尚未建立份额`
+                        : "按各份额独立记录"}</p>
                     </div>
                     <div>
                       <span>等待处理</span>
@@ -1721,18 +1792,19 @@ function Workspace({
                     </small>
                   </section>
                   <div className="live-overview-grid">
-                    <section className="panel">
+                    <section className="panel" ref={overviewNavPanelRef}>
                       <div className="panel-head">
                         <div>
                           <h2>净值，一目了然</h2>
-                          <p>各产品份额的最新有效数据</p>
+                          <p>全部在管产品及其份额的最新有效数据</p>
                         </div>
                         <Button variant="ghost" onClick={() => go("nav")}>
                           查看全部
                           <ArrowRight size={14} />
                         </Button>
                       </div>
-                      {shares.length ? (
+                      {overviewNavRows.length ? (
+                        <>
                         <Table>
                           <TableHeader>
                             <TableRow>
@@ -1743,14 +1815,14 @@ function Workspace({
                             </TableRow>
                           </TableHeader>
                           <TableBody>
-                            {shares.slice(0, 6).map((s) => (
+                            {visibleOverviewNavRows.map((s) => (
                               <TableRow key={s.id}>
                                 <TableCell>
                                   <button
                                     className="text-link"
                                     onClick={() => {
                                       setSelectedProduct(s.product.id);
-                                      setSelectedShare(s.id);
+                                      setSelectedShare(s.missingShare ? "" : s.id);
                                       go("nav");
                                     }}
                                   >
@@ -1761,7 +1833,7 @@ function Workspace({
                                   </small>
                                 </TableCell>
                                 <TableCell className="numeric">
-                                  {number(s.latest?.unit_nav)}
+                                  {s.missingShare ? "—" : number(s.latest?.unit_nav)}
                                 </TableCell>
                                 <TableCell>{s.latest?.valuation_date || "—"}</TableCell>
                                 <TableCell>
@@ -1776,6 +1848,8 @@ function Workspace({
                                     text={
                                       s.latest?.reversal
                                         ? "反账后"
+                                        : s.missingShare
+                                          ? "待建立份额"
                                         : s.latest
                                           ? "已确认"
                                           : "等待净值"
@@ -1786,10 +1860,30 @@ function Workspace({
                             ))}
                           </TableBody>
                         </Table>
+                        <div className="table-footer overview-nav-pagination">
+                          <span>
+                            第 {effectiveOverviewNavPage * overviewNavPageSize + 1}–{Math.min((effectiveOverviewNavPage + 1) * overviewNavPageSize, overviewNavRows.length)} 条，共 {overviewNavRows.length} 条
+                          </span>
+                          {overviewNavPageCount > 1 && (
+                            <div className="row-actions">
+                              <Button
+                                variant="ghost"
+                                disabled={effectiveOverviewNavPage === 0}
+                                onClick={() => setOverviewNavPage((page) => Math.max(0, page - 1))}
+                              >上一页</Button>
+                              <Button
+                                variant="ghost"
+                                disabled={effectiveOverviewNavPage >= overviewNavPageCount - 1}
+                                onClick={() => setOverviewNavPage((page) => Math.min(overviewNavPageCount - 1, page + 1))}
+                              >下一页</Button>
+                            </div>
+                          )}
+                        </div>
+                        </>
                       ) : (
                         <Empty
                           title="从第一只产品开始"
-                          text="新建产品台账，或上传托管附件识别产品信息。"
+                          text="当前没有在管产品；新建产品台账或上传托管附件后会显示在这里。"
                         >
                           {perm?.write && (
                             <Button variant="outline" onClick={() => setModal({ kind: "product" })}>
@@ -1800,7 +1894,7 @@ function Workspace({
                         </Empty>
                       )}
                     </section>
-                    <div className="overview-side">
+                    <div className="overview-side" ref={overviewSideRef}>
                       <OperationCalendar managerId={managerId} revision={revision} />
                       <section className="panel">
                       <div className="panel-head">
