@@ -211,7 +211,7 @@ def test_material_organization_routes_nav_and_rejects_invalid_scope(env):
 
 
 def test_material_server_pagination_search_and_subject_filters(env):
-    _, client, ids = env
+    app, client, ids = env
     login(client)
     first = product(client, ids["a"], "PAGE001")
     second = product(client, ids["a"], "PAGE002")
@@ -269,7 +269,13 @@ def test_material_server_pagination_search_and_subject_filters(env):
     body = page.json()
     assert body["total"] == 3
     assert len(body["items"]) == 2
-    assert body["counts"] == {"all": 3, "pending": 1, "linked": 2, "attention": 1}
+    assert body["counts"] == {
+        "all": 3,
+        "pending": 1,
+        "linked": 2,
+        "attention": 1,
+        "work": 1,
+    }
     second_page = client.get(
         f"/api/managers/{ids['a']}/documents",
         params={"paginated": "true", "limit": 2, "offset": 2},
@@ -299,5 +305,89 @@ def test_material_server_pagination_search_and_subject_filters(env):
         params={"paginated": "true", "status": "pending"},
     ).json()
     assert [item["id"] for item in by_pending["items"]] == [pending["id"]]
+
+    # A formal document may mention an investor and a different product, but
+    # document co-occurrence must never create a business relationship.
+    cross_material = client.put(
+        f"/api/documents/{report['id']}/material",
+        json=organization(
+            1,
+            [second["id"]],
+            investor_ids=[investor["id"]],
+            sensitivity="investor_sensitive",
+            category="periodic_report",
+            title="第三季度运行报告",
+        ),
+    )
+    assert cross_material.status_code == 200, cross_material.text
+
+    # The subject workspace must aggregate the complete archive instead of the
+    # legacy, non-paginated 300-row response used by older screens.
+    with app.state.factory.begin() as db:
+        for index in range(301):
+            document_id = f"bulk-material-{index:03}"
+            db.add(
+                Document(
+                    id=document_id,
+                    manager_id=ids["a"],
+                    product_id=first["id"],
+                    filename=f"历史材料-{index:03}.pdf",
+                    sha256=f"{index:064x}",
+                    storage_key=f"qa/{document_id}",
+                    size=1,
+                    media_type="application/pdf",
+                    source="upload",
+                )
+            )
+            db.add(
+                DocumentMaterial(
+                    document_id=document_id,
+                    manager_id=ids["a"],
+                    category="contract",
+                    title=f"历史材料 {index:03}",
+                    status="organized",
+                )
+            )
+            db.add(
+                DocumentMaterialProduct(
+                    manager_id=ids["a"],
+                    document_id=document_id,
+                    product_id=first["id"],
+                )
+            )
+
+    workspace = client.get(
+        f"/api/managers/{ids['a']}/material-workspace"
+    )
+    assert workspace.status_code == 200, workspace.text
+    workspace_body = workspace.json()
+    first_stats = next(
+        item for item in workspace_body["products"] if item["id"] == first["id"]
+    )
+    assert first_stats == {
+        "id": first["id"],
+        "material_count": 302,
+        "attention_count": 0,
+        "relation_count": 1,
+    }
+    investor_stats = next(
+        item
+        for item in workspace_body["investors"]
+        if item["id"] == investor["id"]
+    )
+    assert investor_stats["material_count"] == 2
+    assert investor_stats["relation_count"] == 1
+    assert workspace_body["relations"] == [
+        {
+            "product_id": first["id"],
+            "investor_id": investor["id"],
+            "material_count": 1,
+            "attention_count": 0,
+            "holding_status": "confirmed",
+            "relation_source": "administrator",
+            "current_units": None,
+            "as_of_date": None,
+        }
+    ]
 
     assert isinstance(client.get(f"/api/managers/{ids['a']}/documents").json(), list)

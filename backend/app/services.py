@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from openpyxl import load_workbook
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 
 from .db import now
 from .models import (
@@ -179,6 +179,19 @@ def import_investor_position_documents(db, settings, limit=50):
             and existing_material.organization_source == "automatic"
             and existing_material.material_type == "position_statement"
         ):
+            # A batch workbook is data evidence.  Its rows may establish exact
+            # investor/product holdings, but the workbook itself must not imply
+            # that every investor in the file is related to every product.
+            db.execute(
+                delete(DocumentMaterialProduct).where(
+                    DocumentMaterialProduct.document_id == document.id
+                )
+            )
+            db.execute(
+                delete(DocumentMaterialInvestor).where(
+                    DocumentMaterialInvestor.document_id == document.id
+                )
+            )
             continue
         path = settings.storage / document.storage_key
         if not path.is_file():
@@ -246,7 +259,6 @@ def import_investor_position_documents(db, settings, limit=50):
         }
         imported = issues = duplicates = 0
         linked_products = set()
-        linked_investors = set()
         dates = set()
         for record in rows:
             product = products_by_code.get(record["product_code"])
@@ -398,7 +410,6 @@ def import_investor_position_documents(db, settings, limit=50):
                 db.add(snapshot)
                 imported += 1
             linked_products.add(product.id)
-            linked_investors.add(investor.id)
             dates.add(record["as_of_date"])
         timestamp = now()
         if mail_item.category != "investor_redemption" or mail_item.handling_mode == "pending":
@@ -429,21 +440,20 @@ def import_investor_position_documents(db, settings, limit=50):
         material.confirmed_at = timestamp
         material.created_at = material.created_at or timestamp
         material.updated_at = timestamp
+        # Product links on the mail are useful for search.  Material links are
+        # deliberately omitted: a multi-subject spreadsheet is not a formal
+        # material belonging in every subject dossier.
+        db.execute(
+            delete(DocumentMaterialProduct).where(
+                DocumentMaterialProduct.document_id == document.id
+            )
+        )
+        db.execute(
+            delete(DocumentMaterialInvestor).where(
+                DocumentMaterialInvestor.document_id == document.id
+            )
+        )
         for product_id in linked_products:
-            if not db.scalar(
-                select(DocumentMaterialProduct).where(
-                    DocumentMaterialProduct.document_id == document.id,
-                    DocumentMaterialProduct.product_id == product_id,
-                )
-            ):
-                db.add(
-                    DocumentMaterialProduct(
-                        manager_id=document.manager_id,
-                        document_id=document.id,
-                        product_id=product_id,
-                        created_at=timestamp,
-                    )
-                )
             if not db.scalar(
                 select(MailItemProduct).where(
                     MailItemProduct.mail_item_id == mail_item.id,
@@ -455,21 +465,6 @@ def import_investor_position_documents(db, settings, limit=50):
                         manager_id=document.manager_id,
                         mail_item_id=mail_item.id,
                         product_id=product_id,
-                    )
-                )
-        for investor_id in linked_investors:
-            if not db.scalar(
-                select(DocumentMaterialInvestor).where(
-                    DocumentMaterialInvestor.document_id == document.id,
-                    DocumentMaterialInvestor.investor_id == investor_id,
-                )
-            ):
-                db.add(
-                    DocumentMaterialInvestor(
-                        manager_id=document.manager_id,
-                        document_id=document.id,
-                        investor_id=investor_id,
-                        created_at=timestamp,
                     )
                 )
         action = db.scalar(select(MailAction).where(MailAction.mail_item_id == mail_item.id))

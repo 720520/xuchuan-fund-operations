@@ -190,7 +190,7 @@ export type Doc = {
   notes?: string;
   sensitivity?: "standard" | "investor_sensitive";
   material_status?: "pending" | "organized";
-  organization_source?: "manual" | "system_parse" | null;
+  organization_source?: "manual" | "automatic" | "system_parse" | null;
   material_revision?: number;
   organized_at?: string | null;
   organized_by?: string | null;
@@ -220,7 +220,33 @@ export type DocPage = {
     pending: number;
     linked: number;
     attention: number;
+    work: number;
   };
+};
+export type MaterialWorkspaceSummary = {
+  products: {
+    id: string;
+    material_count: number;
+    attention_count: number;
+    relation_count: number;
+  }[];
+  investors: {
+    id: string;
+    material_count: number;
+    attention_count: number;
+    relation_count: number;
+    checklist_counts: Record<string, number>;
+  }[];
+  relations: {
+    product_id: string;
+    investor_id: string;
+    material_count: number;
+    attention_count: number;
+    holding_status: "active" | "historical" | "confirmed";
+    relation_source: "position" | "transaction" | "administrator";
+    current_units: string | null;
+    as_of_date: string | null;
+  }[];
 };
 export type InvestorBankAccount = {
   id: string;

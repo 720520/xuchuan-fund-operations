@@ -18,7 +18,7 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, can
   onAction: (item: MailItem) => void; onClassify: (item: MailItem) => void; onShareEvent: (item: MailItem) => void; onPositionSnapshot: (item: MailItem) => void;
 }) {
   const [mailbox, setMailbox] = useState("");
-  const [filter, setFilter] = useState("all");
+  const [filter, setFilter] = useState("inbox");
   const [search, setSearch] = useState("");
   const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState("");
@@ -26,7 +26,7 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, can
   useEffect(() => {
     if (!target?.itemId) return;
     setMailbox("");
-    setFilter("all");
+    setFilter("inbox");
     setSearch("");
     setOffset(0);
     setSelected(target.itemId);
@@ -39,7 +39,7 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, can
   const items = state.data?.items || [];
   const item = items.find((entry) => entry.id === selected) || items[0];
   const currentBox = boxes.find((box) => box.id === mailbox);
-  function chooseMailbox(id: string) { setTargetItem(""); setMailbox(id); setOffset(0); setSelected(""); setFilter("all"); setSearch(""); }
+  function chooseMailbox(id: string) { setTargetItem(""); setMailbox(id); setOffset(0); setSelected(""); setFilter("inbox"); setSearch(""); }
   return <section className="mail-workspace">
     <aside className="mail-account-nav" aria-label="选择接收邮箱">
       <h2>邮箱</h2>
@@ -53,9 +53,9 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, can
     </aside>
     <section className="mail-message-list" aria-label="邮件列表">
       <header><h2>{currentBox?.label || "全部邮箱"}</h2><small>{state.data ? `${state.data.total} 封邮件` : "正在加载…"}</small>
-        <input aria-label="搜索邮件" placeholder="搜索主题、发件人或产品" value={search} onChange={(e) => { setTargetItem(""); setSearch(e.target.value); setOffset(0); setSelected(""); }} />
+        <input aria-label="搜索邮件" placeholder="搜索主题、附件、发件人或产品" value={search} onChange={(e) => { setTargetItem(""); setSearch(e.target.value); setOffset(0); setSelected(""); }} />
         <select aria-label="邮件处理状态" value={filter} onChange={(e) => { setTargetItem(""); setFilter(e.target.value); setOffset(0); setSelected(""); }}>
-          <option value="all">全部邮件</option><option value="action">待处理</option><option value="receipt">接收记录</option><option value="pending">待分类</option><option value="completed">已完成</option>
+          <option value="inbox">日常邮件</option><option value="action">待处理</option><option value="pending">待分类</option><option value="receipt">接收记录</option><option value="completed">已完成</option><option value="all">全部邮件（含自动处理）</option>
         </select>
       </header>
       {state.error && <p className="mail-list-note" role="alert">{state.error}</p>}
@@ -78,11 +78,11 @@ export function MailWorkspace({ base, boxes, boxesError, revision, canWrite, can
     <article className="mail-reading-pane" aria-label="邮件正文与附件">
       {currentBox && <div className="mail-current-source">{currentBox.label} · 最近同步 {timestamp(currentBox.last_sync)}{currentBox.error && <p role="alert">{currentBox.error}</p>}</div>}
       {item ? <>
-        {((canWrite && (item.action?.status === "open" || item.status === "pending")) || (canManageShares && item.category === "investor_redemption")) && <div className="mail-reading-actions">
+        {((canWrite && (item.action?.status === "open" || item.status === "pending")) || (canManageShares && item.category === "investor_redemption" && item.action?.status === "open")) && <div className="mail-reading-actions">
           {canWrite && item.action?.status === "open" && <><span>{item.action.suggested_action}</span><Button variant="outline" onClick={() => onAction(item)}>处理待办</Button></>}
           {canWrite && item.status === "pending" && <Button variant="outline" onClick={() => onClassify(item)}>确认分类</Button>}
-          {canManageShares && item.category === "investor_redemption" && <Button onClick={() => onShareEvent(item)}>整理份额信息</Button>}
-          {canManageShares && item.category === "investor_redemption" && <Button variant="ghost" onClick={() => onPositionSnapshot(item)}>登记持仓快照</Button>}
+          {canManageShares && item.category === "investor_redemption" && item.action?.status === "open" && <Button onClick={() => onShareEvent(item)}>整理份额信息</Button>}
+          {canManageShares && item.category === "investor_redemption" && item.action?.status === "open" && <Button variant="ghost" onClick={() => onPositionSnapshot(item)}>登记持仓快照</Button>}
         </div>}
         {renderDetail(item)}
       </> : <p className="mail-list-note">{state.loading ? "正在读取…" : "选择邮件后在此阅读正文和附件"}</p>}

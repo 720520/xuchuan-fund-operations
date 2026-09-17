@@ -79,6 +79,7 @@ import {
   type MailDetail,
   type MailItem,
   type Mailbox,
+  type MaterialWorkspaceSummary,
   type Manager,
   type Me,
   type Member,
@@ -208,6 +209,13 @@ const investorMaterialChecklist: InvestorChecklistItem[] = [
   { key: "professional", label: "专业投资者证明", materialTypes: ["professional_investor_proof"], patterns: ["专业投资者"], suitabilityClasses: ["professional", "unknown"] },
   { key: "specific", label: "特定对象确认材料", materialTypes: ["special_object_confirmation"], patterns: ["特定对象"] },
 ];
+
+function matchesInvestorChecklist(document: Doc, item: InvestorChecklistItem) {
+  if (document.material_type && item.materialTypes?.includes(document.material_type)) return true;
+  const text = `${document.title || ""} ${document.filename} ${document.metadata_json.subject || ""}`.toLowerCase();
+  return item.patterns.some((pattern) => text.includes(pattern.toLowerCase()));
+}
+
 type InvestorDetailTab = "basic" | "suitability" | "accounts" | "general" | "business";
 type Modal =
   | { kind: "product"; candidate?: Candidate; documentId?: string }
@@ -216,6 +224,7 @@ type Modal =
   | { kind: "nav-export"; productId?: string }
   | { kind: "upload"; productId?: string; investorId?: string }
   | { kind: "material"; document: Doc }
+  | { kind: "document-preview"; document: Doc }
   | { kind: "investor"; investor?: Investor }
   | { kind: "bank-account"; investor: Investor; account?: InvestorBankAccount }
   | { kind: "share-event"; investor?: Investor; sourceMail?: MailItem }
@@ -863,9 +872,9 @@ function Workspace({
     [mailTarget, setMailTarget] = useState<{ itemId: string; request: number } | null>(null),
     [feedback, setFeedback] = useState(""),
     [search, setSearch] = useState(""),
-    [materialSection, setMaterialSection] = useState<"relations" | "shares" | "documents" | "pending">("relations"),
+    [materialSection, setMaterialSection] = useState<"relations" | "shares" | "documents" | "pending">("pending"),
     [materialPerspective, setMaterialPerspective] = useState<"product" | "investor">("product"),
-    [investorDetailTab, setInvestorDetailTab] = useState<InvestorDetailTab>("basic"),
+    [investorDetailTab, setInvestorDetailTab] = useState<InvestorDetailTab>("suitability"),
     [materialEntitySearch, setMaterialEntitySearch] = useState(""),
     [materialOnlyAttention, setMaterialOnlyAttention] = useState(false),
     [materialFilter, setMaterialFilter] = useState("all"),
@@ -874,6 +883,7 @@ function Workspace({
     [materialCategory, setMaterialCategory] = useState(""),
     [materialSource, setMaterialSource] = useState(""),
     [materialSensitivity, setMaterialSensitivity] = useState(""),
+    [investorMaterialScope, setInvestorMaterialScope] = useState<"all" | "general" | "business">("all"),
     [materialPage, setMaterialPage] = useState(0),
     [showHiddenProducts, setShowHiddenProducts] = useState(false),
     [selectedProduct, setSelectedProduct] = useState(""),
@@ -928,6 +938,10 @@ function Workspace({
     base && perm?.investor_read ? base + "/investors" : null,
     revision,
   );
+  const materialWorkspaceState = useResource<MaterialWorkspaceSummary>(
+    base && perm?.archive && view === "upload" ? base + "/material-workspace" : null,
+    revision,
+  );
   const materialProducts = productsState.data || [];
   const materialInvestors = investorsState.data || [];
   const effectiveMaterialSection = perm?.investor_read ? materialSection : materialSection === "relations" ? "documents" : materialSection;
@@ -943,7 +957,7 @@ function Workspace({
     paginated: "true",
     limit: String(materialPageSize),
     offset: String(materialPage * materialPageSize),
-    status: effectiveMaterialSection === "pending" ? "pending" : materialFilter,
+    status: effectiveMaterialSection === "pending" ? "work" : materialFilter,
   });
   if (effectiveMaterialProduct) materialParams.set("product_id", effectiveMaterialProduct);
   if (effectiveMaterialInvestor) materialParams.set("investor_id", effectiveMaterialInvestor);
@@ -1006,9 +1020,9 @@ function Workspace({
     setSelectedShare("");
     setModal(null);
     setSearch("");
-    setMaterialSection("relations");
+    setMaterialSection("pending");
     setMaterialPerspective("product");
-    setInvestorDetailTab("basic");
+    setInvestorDetailTab("suitability");
     setMaterialEntitySearch("");
     setMaterialOnlyAttention(false);
     setMaterialFilter("all");
@@ -1017,6 +1031,7 @@ function Workspace({
     setMaterialCategory("");
     setMaterialSource("");
     setMaterialSensitivity("");
+    setInvestorMaterialScope("all");
     setMaterialPage(0);
     setShowHiddenProducts(false);
     setFeedback("");
@@ -1116,9 +1131,23 @@ function Workspace({
     pending: unorganizedMaterials.length,
     linked: linkedMaterials.length,
     attention: attentionMaterials.length,
+    work: new Set([...unorganizedMaterials, ...attentionMaterials].map((document) => document.id)).size,
   };
   const filteredMaterials = materialPageState.data?.items || [];
   const filteredMaterialTotal = materialPageState.data?.total || 0;
+  const workspaceSummary = materialWorkspaceState.data;
+  const productWorkspaceStats = new Map(
+    (workspaceSummary?.products || []).map((item) => [item.id, item]),
+  );
+  const investorWorkspaceStats = new Map(
+    (workspaceSummary?.investors || []).map((item) => [item.id, item]),
+  );
+  const materialRelationStats = new Map(
+    (workspaceSummary?.relations || []).map((item) => [
+      `${item.product_id}:${item.investor_id}`,
+      item,
+    ]),
+  );
   const materialNeedsAttention = (document: Doc) =>
     document.material_status !== "organized" ||
     ["queued", "processing", "review"].includes(document.job?.status || "");
@@ -1134,28 +1163,25 @@ function Workspace({
         .filter((investor) => investor.product_ids.includes(product.id))
         .map((investor) => investor.id),
     );
-    entityDocuments.forEach((document) =>
-      (document.investor_ids || []).forEach((id) => relatedInvestorIds.add(id)),
-    );
+    const stats = productWorkspaceStats.get(product.id);
     return {
       ...product,
-      relationCount: relatedInvestorIds.size,
-      materialCount: entityDocuments.length,
-      attentionCount: entityDocuments.filter(materialNeedsAttention).length,
+      relationCount: stats?.relation_count ?? relatedInvestorIds.size,
+      materialCount: stats?.material_count ?? entityDocuments.length,
+      attentionCount: stats?.attention_count ?? entityDocuments.filter(materialNeedsAttention).length,
     };
   });
   const investorEntities = investors.map((investor) => {
     const entityDocuments = documentsFor(undefined, investor.id);
     const relatedProductIds = new Set(investor.product_ids);
-    entityDocuments.forEach((document) =>
-      materialProductIds(document).forEach((id) => relatedProductIds.add(id)),
-    );
+    const stats = investorWorkspaceStats.get(investor.id);
     return {
       ...investor,
-      relationCount: relatedProductIds.size,
-      materialCount: entityDocuments.length,
-      attentionCount:
+      relationCount: stats?.relation_count ?? relatedProductIds.size,
+      materialCount: stats?.material_count ?? entityDocuments.length,
+      attentionCount: stats?.attention_count ??
         entityDocuments.filter(materialNeedsAttention).length + (investor.status === "pending" ? 1 : 0),
+      checklistCounts: stats?.checklist_counts || {},
     };
   });
   const selectedWorkbenchProduct =
@@ -1176,14 +1202,14 @@ function Workspace({
     ? investorEntities
         .filter((investor) =>
           investor.product_ids.includes(selectedWorkbenchProduct.id) ||
-          documentsFor(selectedWorkbenchProduct.id, investor.id).length > 0,
+          materialRelationStats.has(`${selectedWorkbenchProduct.id}:${investor.id}`),
         )
         .map((investor) => {
-          const commonDocuments = documentsFor(selectedWorkbenchProduct.id, investor.id);
+          const relation = materialRelationStats.get(`${selectedWorkbenchProduct.id}:${investor.id}`);
           return {
             ...investor,
-            commonMaterialCount: commonDocuments.length,
-            commonAttentionCount: commonDocuments.filter(materialNeedsAttention).length,
+            commonMaterialCount: relation?.material_count || 0,
+            commonAttentionCount: relation?.attention_count || 0,
           };
         })
     : [];
@@ -1191,33 +1217,19 @@ function Workspace({
     ? productEntities
         .filter((product) =>
           selectedWorkbenchInvestor.product_ids.includes(product.id) ||
-          documentsFor(product.id, selectedWorkbenchInvestor.id).length > 0,
+          materialRelationStats.has(`${product.id}:${selectedWorkbenchInvestor.id}`),
         )
         .map((product) => {
-          const commonDocuments = documentsFor(product.id, selectedWorkbenchInvestor.id);
+          const relation = materialRelationStats.get(`${product.id}:${selectedWorkbenchInvestor.id}`);
           return {
             ...product,
-            commonMaterialCount: commonDocuments.length,
-            commonAttentionCount: commonDocuments.filter(materialNeedsAttention).length,
+            commonMaterialCount: relation?.material_count || 0,
+            commonAttentionCount: relation?.attention_count || 0,
           };
         })
     : [];
   const selectedRelatedInvestor = relatedWorkbenchInvestors.find((investor) => investor.id === materialInvestor);
   const selectedRelatedProduct = relatedWorkbenchProducts.find((product) => product.id === materialProduct);
-  const selectedInvestorDocuments = selectedWorkbenchInvestor
-    ? documentsFor(undefined, selectedWorkbenchInvestor.id)
-    : [];
-  const selectedInvestorGeneralDocuments = selectedInvestorDocuments.filter(
-    (document) =>
-      materialCategoryOf(document) === "investor_qualification" ||
-      materialProductIds(document).length === 0,
-  );
-  const selectedInvestorBusinessDocuments =
-    selectedWorkbenchInvestor && selectedRelatedProduct
-      ? documentsFor(selectedRelatedProduct.id, selectedWorkbenchInvestor.id).filter(
-          (document) => materialCategoryOf(document) !== "investor_qualification",
-        )
-      : [];
   const selectedInvestorChecklist = investorMaterialChecklist
     .filter(
       (item) =>
@@ -1228,14 +1240,16 @@ function Workspace({
     )
     .map((item) => ({
       ...item,
-      documents: selectedInvestorDocuments.filter((document) => {
-        const haystack = (document.filename + " " + (document.title || "")).toLowerCase();
-        return Boolean(
-          (document.material_type && item.materialTypes?.includes(document.material_type)) ||
-          item.patterns.some((pattern) => haystack.includes(pattern.toLowerCase())),
-        );
-      }),
+      count: selectedWorkbenchInvestor?.checklistCounts[item.key] || 0,
+      documents: filteredMaterials.filter((document) => matchesInvestorChecklist(document, item)),
     }));
+  const selectedInvestorMissingCount = selectedInvestorChecklist.filter((item) => !item.count).length;
+  const selectedInvestorChecklistDocumentIds = new Set(
+    selectedInvestorChecklist.flatMap((item) => item.documents.map((document) => document.id)),
+  );
+  const selectedInvestorBusinessDocuments = filteredMaterials.filter(
+    (document) => !selectedInvestorChecklistDocumentIds.has(document.id),
+  );
 
   function resetMaterialFilters() {
     setMaterialCategory("");
@@ -1345,7 +1359,16 @@ function Workspace({
                       <div className="file-identity compact-file-identity">
                         <FileText size={17} />
                         <div>
-                          <strong>{document.title || document.metadata_json.subject || document.filename}</strong>
+                          {perm?.download ? (
+                            <button
+                              className="material-file-open"
+                              onClick={() => setModal({ kind: "document-preview", document })}
+                            >
+                              {document.title || document.metadata_json.subject || document.filename}
+                            </button>
+                          ) : (
+                            <strong>{document.title || document.metadata_json.subject || document.filename}</strong>
+                          )}
                           <small className="block-sub">{document.filename} · {(document.size / 1024).toFixed(1)} KB</small>
                         </div>
                       </div>
@@ -1386,6 +1409,11 @@ function Workspace({
                     </TableCell>
                     <TableCell>
                       <div className="row-actions material-row-actions">
+                        {perm?.download && (
+                          <Button variant="ghost" onClick={() => setModal({ kind: "document-preview", document })}>
+                            查看
+                          </Button>
+                        )}
                         {perm?.write && (
                           <Button variant="outline" onClick={() => setModal({ kind: "material", document })}>
                             {document.material_status === "organized" ? "调整" : "整理"}
@@ -1495,7 +1523,7 @@ function Workspace({
               title={sidebarCollapsed ? n.label : undefined}
               onClick={() => {
                 if (n.id === "upload") {
-                  setMaterialSection(perm?.investor_read ? "relations" : "documents");
+                  setMaterialSection("pending");
                   setMaterialPerspective("product");
                   setMaterialEntitySearch("");
                   setMaterialOnlyAttention(false);
@@ -2402,8 +2430,8 @@ function Workspace({
                     title={view === "mail" ? "邮件中心" : "资料中心"}
                     text={
                       view === "mail"
-                        ? "按接收邮箱查看全部已归档邮件，点击列表直接阅读正文和附件。"
-                        : "从产品或投资者出发，查看双方关系及其共同资料；原件、整理结果和处理记录始终可以追溯。"
+                        ? "默认聚焦需要处理的业务邮件；自动处理的数据邮件仍可通过搜索或全部邮件查找。"
+                        : "先处理需要行动的资料，再从产品或投资者档案查清原件、关系和处理依据。"
                     }
                   >
                     {view === "mail" && perm?.write && (
@@ -2439,6 +2467,18 @@ function Workspace({
                   {view === "upload" && (
                     <>
                       <div className="view-tabs material-primary-tabs" aria-label="资料中心视图">
+                        <button
+                          className={effectiveMaterialSection === "pending" ? "current" : ""}
+                          onClick={() => {
+                            setMaterialSection("pending");
+                            setMaterialFilter("all");
+                            setMaterialProduct("");
+                            setMaterialInvestor("");
+                            resetMaterialFilters();
+                          }}
+                        >
+                          待处理 <small>{materialCounts.work}</small>
+                        </button>
                         {perm?.investor_read && (
                           <button
                             className={effectiveMaterialSection === "relations" ? "current" : ""}
@@ -2448,21 +2488,7 @@ function Workspace({
                               resetMaterialFilters();
                             }}
                           >
-                            关系工作台
-                          </button>
-                        )}
-                        {perm?.investor_read && (
-                          <button
-                            className={effectiveMaterialSection === "shares" ? "current" : ""}
-                            onClick={() => {
-                              setMaterialSection("shares");
-                              setMaterialFilter("all");
-                              setMaterialProduct("");
-                              setMaterialInvestor("");
-                              resetMaterialFilters();
-                            }}
-                          >
-                            投资者份额
+                            主体档案
                           </button>
                         )}
                         <button
@@ -2477,18 +2503,20 @@ function Workspace({
                         >
                           全部资料
                         </button>
-                        <button
-                          className={effectiveMaterialSection === "pending" ? "current" : ""}
-                          onClick={() => {
-                            setMaterialSection("pending");
-                            setMaterialFilter("pending");
-                            setMaterialProduct("");
-                            setMaterialInvestor("");
-                            resetMaterialFilters();
-                          }}
-                        >
-                          待整理 <small>{materialCounts.pending}</small>
-                        </button>
+                        {perm?.investor_read && (
+                          <button
+                            className={effectiveMaterialSection === "shares" ? "current" : ""}
+                            onClick={() => {
+                              setMaterialSection("shares");
+                              setMaterialFilter("all");
+                              setMaterialProduct("");
+                              setMaterialInvestor("");
+                              resetMaterialFilters();
+                            }}
+                          >
+                            份额台账
+                          </button>
+                        )}
                       </div>
 
                       {effectiveMaterialSection === "shares" && base && (
@@ -2520,7 +2548,7 @@ function Workspace({
                                 className={materialPerspective === "investor" ? "current" : ""}
                                 onClick={() => {
                                   setMaterialPerspective("investor");
-                                  setInvestorDetailTab("basic");
+                                  setInvestorDetailTab("suitability");
                                   setMaterialInvestor(materialInvestor || selectedRelatedInvestor?.id || investors[0]?.id || "");
                                   setMaterialProduct("");
                                   setMaterialPage(0);
@@ -2569,7 +2597,7 @@ function Workspace({
                                     <span className="material-entity-counts">
                                       <small>{product.relationCount} 个关联</small>
                                       <small>{product.materialCount} 份资料</small>
-                                      <small className={product.attentionCount ? "attention" : ""}>{product.attentionCount} 待核对</small>
+                                      <small className={product.attentionCount ? "attention" : ""}>{product.attentionCount} 待处理</small>
                                     </span>
                                   </button>
                                 )) : searchedInvestorEntities.map((investor) => (
@@ -2578,7 +2606,7 @@ function Workspace({
                                     className={selectedWorkbenchInvestor?.id === investor.id ? "current" : ""}
                                     onClick={() => {
                                       setMaterialInvestor(investor.id);
-                                      setInvestorDetailTab("basic");
+                                      setInvestorDetailTab("suitability");
                                       setMaterialProduct("");
                                       setMaterialPage(0);
                                     }}
@@ -2588,7 +2616,7 @@ function Workspace({
                                     <span className="material-entity-counts">
                                       <small>{investor.relationCount} 个关联</small>
                                       <small>{investor.materialCount} 份资料</small>
-                                      <small className={investor.attentionCount ? "attention" : ""}>{investor.attentionCount} 待核对</small>
+                                      <small className={investor.attentionCount ? "attention" : ""}>{investor.attentionCount} 待处理</small>
                                     </span>
                                   </button>
                                 ))}
@@ -2631,9 +2659,9 @@ function Workspace({
                                         <Button variant="outline" onClick={() => setModal({ kind: "investor", investor: selectedWorkbenchInvestor })}>编辑投资者</Button>
                                       )}
                                       <div className="material-subject-stats">
-                                        <div><span>关联{materialPerspective === "product" ? "投资者" : "产品"}</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.relationCount : selectedWorkbenchInvestor?.relationCount}</strong></div>
+                                        <div><span>{materialPerspective === "product" ? "关联投资者" : "待补资料"}</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.relationCount : selectedInvestorMissingCount}</strong></div>
                                         <div><span>资料</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.materialCount : selectedWorkbenchInvestor?.materialCount}</strong></div>
-                                        <div className="attention"><span>待核对</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.attentionCount : selectedWorkbenchInvestor?.attentionCount}</strong></div>
+                                        <div className="attention"><span>待处理</span><strong>{materialPerspective === "product" ? selectedWorkbenchProduct?.attentionCount : selectedWorkbenchInvestor?.attentionCount}</strong></div>
                                       </div>
                                     </div>
                                   </header>
@@ -2641,11 +2669,10 @@ function Workspace({
                                   {materialPerspective === "investor" && (
                                     <nav className="investor-detail-tabs" aria-label="投资者资料分区">
                                       {([
+                                        ["suitability", "资料清单"],
+                                        ["business", "产品业务"],
+                                        ["accounts", "账户信息"],
                                         ["basic", "基本信息"],
-                                        ["suitability", "适当性"],
-                                        ["accounts", "银行账户"],
-                                        ["general", "通用资料"],
-                                        ["business", "产品业务资料"],
                                       ] as [InvestorDetailTab, string][]).map(([tab, label]) => (
                                         <button
                                           key={tab}
@@ -2680,7 +2707,7 @@ function Workspace({
                                         >
                                           <strong>{investor.display_name}</strong>
                                           <small>{investorTypeLabels[investor.investor_type]} · {investorStatusLabels[investor.status]}</small>
-                                          <span><small>{investor.commonMaterialCount} 份资料</small><small className={investor.commonAttentionCount ? "attention" : ""}>{investor.commonAttentionCount ? `待核对 ${investor.commonAttentionCount}` : "已核对"}</small></span>
+                                          <span><small>{investor.commonMaterialCount} 份资料</small><small className={investor.commonAttentionCount ? "attention" : ""}>{investor.commonAttentionCount ? `待处理 ${investor.commonAttentionCount}` : investor.commonMaterialCount ? "暂无待处理" : "尚无共同资料"}</small></span>
                                         </button>
                                       )) : relatedWorkbenchProducts.map((product) => (
                                         <button
@@ -2693,7 +2720,7 @@ function Workspace({
                                         >
                                           <strong>{product.name}</strong>
                                           <small>{product.code}</small>
-                                          <span><small>{product.commonMaterialCount} 份资料</small><small className={product.commonAttentionCount ? "attention" : ""}>{product.commonAttentionCount ? `待核对 ${product.commonAttentionCount}` : "已核对"}</small></span>
+                                          <span><small>{product.commonMaterialCount} 份资料</small><small className={product.commonAttentionCount ? "attention" : ""}>{product.commonAttentionCount ? `待处理 ${product.commonAttentionCount}` : product.commonMaterialCount ? "暂无待处理" : "尚无共同资料"}</small></span>
                                         </button>
                                       ))}
                                       {materialPerspective === "product" && !relatedWorkbenchInvestors.length && <p className="material-list-empty">该产品尚未关联投资者。</p>}
@@ -2729,8 +2756,15 @@ function Workspace({
                                       )}
                                       <div className="investor-related-products">
                                         <div className="material-section-heading">
-                                          <strong>关联产品</strong>
-                                          <span>{relatedWorkbenchProducts.length} 只</span>
+                                          <div>
+                                            <strong>关联产品</strong>
+                                            <span>{relatedWorkbenchProducts.length} 只 · 仅按持仓、已确认交易或管理员核实建立</span>
+                                          </div>
+                                          {perm?.admin && (
+                                            <Button variant="outline" onClick={() => setModal({ kind: "investor", investor: selectedWorkbenchInvestor })}>
+                                              修正关联
+                                            </Button>
+                                          )}
                                         </div>
                                         <div className="investor-product-chips">
                                           {relatedWorkbenchProducts.map((product) => (
@@ -2743,7 +2777,13 @@ function Workspace({
                                               }}
                                             >
                                               <strong>{product.name}</strong>
-                                              <small>{product.code}</small>
+                                              <small>{product.code} · {
+                                                materialRelationStats.get(`${product.id}:${selectedWorkbenchInvestor.id}`)?.holding_status === "active"
+                                                  ? "当前持有"
+                                                  : materialRelationStats.get(`${product.id}:${selectedWorkbenchInvestor.id}`)?.holding_status === "historical"
+                                                    ? "历史投资"
+                                                    : "管理员确认"
+                                              }</small>
                                             </button>
                                           ))}
                                           {!relatedWorkbenchProducts.length && <span className="material-list-empty">尚未关联产品</span>}
@@ -2753,36 +2793,110 @@ function Workspace({
                                   )}
 
                                   {materialPerspective === "investor" && investorDetailTab === "suitability" && selectedWorkbenchInvestor && (
-                                    <section className="investor-profile-section">
-                                      <div className="investor-profile-heading">
+                                    <section className="investor-material-workspace">
+                                      <div className="investor-material-scope">
                                         <div>
-                                          <strong>适当性信息</strong>
-                                          <span>当前字段与归档原件分开呈现</span>
+                                          <strong>资料适用范围</strong>
+                                          <span>按主体通用材料与具体产品业务材料分组查看</span>
                                         </div>
+                                        <select
+                                          aria-label="资料适用范围"
+                                          value={investorMaterialScope}
+                                          onChange={(event) => setInvestorMaterialScope(event.target.value as "all" | "general" | "business")}
+                                        >
+                                          <option value="all">全部范围</option>
+                                          <option value="general">主体通用材料</option>
+                                          <option value="business">具体产品与业务材料</option>
+                                        </select>
                                       </div>
-                                      <dl className="investor-field-grid compact">
-                                        <div><dt>投资者分类</dt><dd>{suitabilityClassLabels[selectedWorkbenchInvestor.suitability_class || "unknown"]}</dd></div>
-                                        <div><dt>专业投资者类型</dt><dd>{selectedWorkbenchInvestor.professional_investor_type || "不适用／待补充"}</dd></div>
-                                        <div><dt>风险等级</dt><dd>{selectedWorkbenchInvestor.risk_level || "待补充"}</dd></div>
-                                        <div><dt>测评日期</dt><dd>{selectedWorkbenchInvestor.risk_assessed_at || "待补充"}</dd></div>
-                                        <div><dt>测评到期日</dt><dd>{selectedWorkbenchInvestor.risk_expires_at || "待补充"}</dd></div>
-                                        <div><dt>特定对象确认</dt><dd>{specificObjectStatusLabels[selectedWorkbenchInvestor.specific_object_status || "unknown"]}</dd></div>
-                                        <div><dt>合格材料状态</dt><dd>{qualifiedMaterialStatusLabels[selectedWorkbenchInvestor.qualified_material_status || "unknown"]}</dd></div>
-                                        <div><dt>材料有效期间</dt><dd>{selectedWorkbenchInvestor.qualified_material_from || "待补充"} 至 {selectedWorkbenchInvestor.qualified_material_until || "待补充"}</dd></div>
-                                      </dl>
-                                      <div className="investor-checklist">
-                                        <div className="material-section-heading">
-                                          <strong>适当性资料</strong>
-                                          <span>清单随主体类型和普通／专业分类变化；优先使用资料细类，旧资料兼容文件名归纳</span>
+
+                                      {investorMaterialScope !== "business" && (
+                                        <div className="investor-material-group">
+                                          <h3>主体通用材料</h3>
+                                          <div className="investor-material-list">
+                                            {selectedInvestorChecklist.map((item) => {
+                                              const document = item.documents[0];
+                                              return (
+                                                <article key={item.key}>
+                                                  <div>
+                                                    <strong>{item.label}</strong>
+                                                    <p>{document
+                                                      ? `${document.title || document.filename}${item.count > 1 ? ` 等 ${item.count} 份` : ""}`
+                                                      : item.count
+                                                        ? `已归档 ${item.count} 份，当前分页未显示原件`
+                                                        : "尚未归档该项材料"}</p>
+                                                  </div>
+                                                  <span className={`material-availability ${item.count ? "archived" : "missing"}`}>
+                                                    {item.count ? "已归档" : "缺失"}
+                                                  </span>
+                                                  <div className="investor-material-actions">
+                                                    {document && perm?.download ? (
+                                                      <button onClick={() => setModal({ kind: "document-preview", document })}>查看 <ArrowRight size={13} /></button>
+                                                    ) : item.count ? (
+                                                      <button onClick={() => {
+                                                        setMaterialSection("documents");
+                                                        setMaterialInvestor(selectedWorkbenchInvestor.id);
+                                                        setSearch(item.patterns[0] || item.label);
+                                                        setMaterialPage(0);
+                                                      }}>查找 <ArrowRight size={13} /></button>
+                                                    ) : perm?.write ? (
+                                                      <button onClick={() => setModal({ kind: "upload", investorId: selectedWorkbenchInvestor.id })}>补充 <ArrowRight size={13} /></button>
+                                                    ) : <small>无操作权限</small>}
+                                                  </div>
+                                                </article>
+                                              );
+                                            })}
+                                          </div>
                                         </div>
-                                        <div className="investor-checklist-grid">
-                                          {selectedInvestorChecklist.map((item) => (
-                                            <div key={item.key} className={item.documents.length ? "present" : ""}>
-                                              <i>{item.documents.length ? "✓" : "—"}</i>
-                                              <span><strong>{item.label}</strong><small>{item.documents.length ? "已归档 " + item.documents.length + " 份" : "待补充"}</small></span>
-                                            </div>
-                                          ))}
+                                      )}
+
+                                      {investorMaterialScope !== "general" && (
+                                        <div className="investor-material-group">
+                                          <h3>具体产品与业务材料</h3>
+                                          <div className="investor-material-list">
+                                            {selectedInvestorBusinessDocuments.map((document) => (
+                                              <article key={document.id}>
+                                                <div>
+                                                  <strong>{document.title || document.metadata_json.subject || document.filename}</strong>
+                                                  <p>{[
+                                                    document.products?.map((product) => product.name).join("、"),
+                                                    materialCategoryLabel(materialCategoryOf(document)),
+                                                    document.business_date || timestamp(document.received_at),
+                                                  ].filter(Boolean).join(" · ")}</p>
+                                                </div>
+                                                <span className={`material-availability ${document.material_status === "organized" ? "viewable" : "attention"}`}>
+                                                  {document.material_status === "organized" ? "可查看" : "待整理"}
+                                                </span>
+                                                <div className="investor-material-actions">
+                                                  {perm?.download && (
+                                                    <button onClick={() => setModal({ kind: "document-preview", document })}>查看 <ArrowRight size={13} /></button>
+                                                  )}
+                                                  {perm?.write && document.material_status !== "organized" && (
+                                                    <button onClick={() => setModal({ kind: "material", document })}>处理 <ArrowRight size={13} /></button>
+                                                  )}
+                                                  {!perm?.download && !perm?.write && <small>无操作权限</small>}
+                                                </div>
+                                              </article>
+                                            ))}
+                                            {!selectedInvestorBusinessDocuments.length && (
+                                              <div className="investor-material-empty">当前没有其他产品或业务资料</div>
+                                            )}
+                                          </div>
                                         </div>
+                                      )}
+
+                                      {filteredMaterialTotal > materialPageSize && (
+                                        <div className="table-footer material-pagination investor-material-pagination">
+                                          <span>第 {materialPage * materialPageSize + 1}–{Math.min((materialPage + 1) * materialPageSize, filteredMaterialTotal)} 条，共 {filteredMaterialTotal} 条</span>
+                                          <div className="row-actions">
+                                            <Button variant="outline" disabled={materialPage === 0 || materialPageState.loading} onClick={() => setMaterialPage((page) => Math.max(0, page - 1))}>上一页</Button>
+                                            <Button variant="outline" disabled={(materialPage + 1) * materialPageSize >= filteredMaterialTotal || materialPageState.loading} onClick={() => setMaterialPage((page) => page + 1)}>下一页</Button>
+                                          </div>
+                                        </div>
+                                      )}
+                                      <div className="investor-material-note">
+                                        <CircleAlert size={16} />
+                                        <p>清单按当前主体分类生成；“已归档”表示原件存在，“可查看”表示可以打开原件，业务核验结果仍需单独记录。</p>
                                       </div>
                                     </section>
                                   )}
@@ -2794,11 +2908,14 @@ function Workspace({
                                           <strong>银行账户</strong>
                                           <span>一个投资者可以登记多个账户，并可指定关联产品</span>
                                         </div>
-                                        {perm?.investor_write && (
-                                          <Button variant="outline" onClick={() => setModal({ kind: "bank-account", investor: selectedWorkbenchInvestor })}>
-                                            <Plus size={14} />新增账户
-                                          </Button>
-                                        )}
+                                        <div className="row-actions">
+                                          <Button variant="ghost" onClick={() => setMaterialSection("shares")}>查看份额台账</Button>
+                                          {perm?.investor_write && (
+                                            <Button variant="outline" onClick={() => setModal({ kind: "bank-account", investor: selectedWorkbenchInvestor })}>
+                                              <Plus size={14} />新增账户
+                                            </Button>
+                                          )}
+                                        </div>
                                       </div>
                                       {selectedWorkbenchInvestor.bank_accounts?.length ? (
                                         <div className="investor-account-list">
@@ -2819,7 +2936,7 @@ function Workspace({
                                     </section>
                                   )}
 
-                                  {(materialPerspective === "product" || investorDetailTab === "general" || (investorDetailTab === "business" && selectedRelatedProduct)) && (
+                                  {(materialPerspective === "product" || (investorDetailTab === "business" && selectedRelatedProduct)) && (
                                   <>
                                   <div className="material-scope">
                                     <span>当前范围</span>
@@ -2828,9 +2945,7 @@ function Workspace({
                                     {(selectedRelatedInvestor || selectedRelatedProduct) && <strong>{selectedRelatedInvestor?.display_name || selectedRelatedProduct?.name}</strong>}
                                     <b>
                                       {materialPerspective === "investor"
-                                        ? investorDetailTab === "general"
-                                          ? "通用资料 " + selectedInvestorGeneralDocuments.length
-                                          : "产品业务资料 " + selectedInvestorBusinessDocuments.length
+                                        ? "产品业务资料 " + filteredMaterialTotal
                                         : selectedRelatedInvestor
                                           ? "共同资料 " + filteredMaterialTotal
                                           : "全部资料 " + filteredMaterialTotal}
@@ -2845,14 +2960,7 @@ function Workspace({
                                   </div>
                                   {materialPerspective === "product" && renderMaterialFilters(false)}
                                   <div className="material-table-wrap">
-                                    {renderMaterialTable(
-                                      true,
-                                      materialPerspective === "investor"
-                                        ? investorDetailTab === "general"
-                                          ? selectedInvestorGeneralDocuments
-                                          : selectedInvestorBusinessDocuments
-                                        : undefined,
-                                    )}
+                                    {renderMaterialTable(true)}
                                   </div>
                                   </>
                                   )}
@@ -2877,10 +2985,10 @@ function Workspace({
                         <section className="panel material-center-panel material-flat-panel">
                           <div className="list-tools material-list-heading">
                             <div>
-                              <h2>{effectiveMaterialSection === "pending" ? "待整理资料" : "全部资料"}</h2>
-                              <p>{effectiveMaterialSection === "pending" ? "补充类别、主体和业务日期后形成可查询的资料关系。" : "按主体、类别、来源和敏感级别查询归档资料。"}</p>
+                              <h2>{effectiveMaterialSection === "pending" ? "需要处理的资料" : "全部资料"}</h2>
+                              <p>{effectiveMaterialSection === "pending" ? "集中处理尚未整理、等待解析或需要人工判断的原件。" : "按主体、类别、来源和敏感级别查询归档资料。"}</p>
                             </div>
-                            {renderMaterialFilters(true)}
+                            {renderMaterialFilters(effectiveMaterialSection === "documents")}
                           </div>
                           {renderMaterialTable(false)}
                         </section>
@@ -2889,7 +2997,7 @@ function Workspace({
                       {effectiveMaterialSection === "relations" && (
                         <div className="callout material-permission-note">
                           <ShieldCheck size={18} />
-                          <p>投资者及其关联资料只向本牌照有权限的运营、管理员及合规角色开放；关系工作台不计算持有份额，也不代替托管平台执行申购或赎回。</p>
+                          <p>投资者及其关联资料只向本牌照有权限的运营、管理员及合规角色开放；主体档案中的“暂无待处理”仅表示当前没有未整理或解析中的原件，不代表业务已经核验完成。</p>
                         </div>
                       )}
                     </>
@@ -3242,7 +3350,7 @@ function Workspace({
           if (!open) setModal(null);
         }}
       >
-        <DialogContent className={`live-dialog ${modal?.kind === "mail-detail" ? "mail-detail-dialog" : ""}`}>
+        <DialogContent className={`live-dialog ${modal?.kind === "mail-detail" ? "mail-detail-dialog" : ""} ${modal?.kind === "document-preview" ? "document-preview-dialog" : ""}`}>
           <DialogHeader>
             <DialogTitle>
               {
@@ -3257,6 +3365,7 @@ function Workspace({
                       ? "上传到投资者"
                       : "上传资料",
                   material: "整理资料",
+                  "document-preview": "查看归档原件",
                   investor: modal?.kind === "investor" && modal.investor ? "整理投资者" : "建立投资者",
                   "bank-account": modal?.kind === "bank-account" && modal.account ? "编辑银行账户" : "新增银行账户",
                   "share-event": "整理份额信息",
@@ -3285,11 +3394,34 @@ function Workspace({
             <DialogDescription>
               {modal?.kind === "mail-detail"
                 ? "完整正文与附件 · HTML 隔离展示并提供纯文本备用"
+                : modal?.kind === "document-preview"
+                  ? "只读预览 · 查看行为留痕"
                 : `${manager?.name || "账号设置"} · 所有操作均会留痕`}
             </DialogDescription>
           </DialogHeader>
           {modal?.kind === "mail-detail" && (
             <MailDetailView key={modal.item.id} item={modal.item} canDownload={Boolean(perm?.download)} />
+          )}
+          {modal?.kind === "document-preview" && (
+            <div className="document-preview">
+              <div className="document-preview-head">
+                <div>
+                  <strong>{modal.document.title || modal.document.metadata_json.subject || modal.document.filename}</strong>
+                  <span>{modal.document.filename} · {(modal.document.size / 1024).toFixed(1)} KB</span>
+                </div>
+                {perm?.download && (
+                  <a className="icon-link" aria-label={`下载 ${modal.document.filename}`} href={`/api/documents/${modal.document.id}/download`}>
+                    <Download size={15} />
+                  </a>
+                )}
+              </div>
+              <iframe
+                key={modal.document.id}
+                title={`预览 ${modal.document.filename}`}
+                src={`/api/documents/${modal.document.id}/preview`}
+                sandbox=""
+              />
+            </div>
           )}
           {modal?.kind === "product" && (
             <ProductForm

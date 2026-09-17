@@ -754,6 +754,7 @@ export function InvestorForm({
           source: val(form, "source"),
           product_ids: form.getAll("product_ids").map(String),
           notes: val(form, "notes"),
+          correction_reason: nullable(form, "correction_reason"),
         };
         return investor
           ? put(`/investors/${investor.id}`, payload)
@@ -856,7 +857,7 @@ export function InvestorForm({
           <option value="material">已归档材料</option>
         </select>
       </Field>
-      <Field label="关联产品" hint="一个投资者可关联多个产品">
+      <Field label="关联产品" hint="只选择有已确认交易、实际持仓或管理员核实依据的产品">
         <div className="material-product-list">
           {products.length ? products.map((product) => (
             <label key={product.id}>
@@ -869,6 +870,11 @@ export function InvestorForm({
       <Field label="核对说明（选填）">
         <textarea name="notes" maxLength={2000} rows={4} defaultValue={investor?.notes || ""} />
       </Field>
+      {investor && (
+        <Field label="本次更正原因" hint="修改前后内容、账号、时间和原因都会保留在业务留痕中">
+          <textarea name="correction_reason" required maxLength={500} rows={2} placeholder="例如：核对托管份额表后解除错误产品关联" />
+        </Field>
+      )}
     </ActionForm>
   );
 }

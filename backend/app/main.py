@@ -21,7 +21,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +30,7 @@ from . import schemas as S
 from .config import Settings
 from .calendar_refresh import read_status as calendar_refresh_status
 from .db import connect, now, uid
+from .document_preview import render_document_preview
 from .mail_classification import (
     apply_manual_classification,
     full_message_text,
@@ -154,13 +155,19 @@ def create_app(settings=None):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
-        response.headers["X-Frame-Options"] = "DENY"
         response.headers["Cache-Control"] = (
             "no-store" if request.url.path.startswith("/api") else "no-cache"
         )
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
-        )
+        if request.url.path.startswith("/api/documents/") and request.url.path.endswith("/preview"):
+            response.headers["X-Frame-Options"] = "SAMEORIGIN"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'; object-src 'none'"
+            )
+        else:
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+            )
         return response
 
     @app.exception_handler(CalendarUnavailable)
@@ -1884,6 +1891,7 @@ def create_app(settings=None):
                     "revision": investor.revision,
                     "certificate_number_changed": certificate_number_changed,
                 },
+                "reason": data.correction_reason or "直接维护投资者当前有效信息",
             },
         )
         return investor_result(
@@ -2458,7 +2466,7 @@ def create_app(settings=None):
         if paginated:
             if not 1 <= limit <= 100 or offset < 0:
                 raise HTTPException(422, "分页参数超出允许范围")
-            if status not in {"all", "pending", "linked", "attention"}:
+            if status not in {"all", "pending", "linked", "attention", "work"}:
                 raise HTTPException(422, "资料状态筛选无效")
             if category not in {
                 "",
@@ -2480,6 +2488,14 @@ def create_app(settings=None):
 
             material_ids = select(DocumentMaterial.document_id).where(
                 DocumentMaterial.manager_id == manager_id
+            )
+            data_evidence_ids = select(DocumentMaterial.document_id).where(
+                DocumentMaterial.manager_id == manager_id,
+                DocumentMaterial.organization_source.in_(["automatic", "system_parse"]),
+                or_(
+                    DocumentMaterial.category == "nav_valuation",
+                    DocumentMaterial.material_type == "position_statement",
+                ),
             )
             organized_ids = select(DocumentMaterial.document_id).where(
                 DocumentMaterial.manager_id == manager_id,
@@ -2506,6 +2522,7 @@ def create_app(settings=None):
             accessible = select(Document.id).where(
                 Document.manager_id == manager_id,
                 ~func.lower(Document.filename).like("%.eml"),
+                ~Document.id.in_(data_evidence_ids),
             )
             if not permissions["investor_read"]:
                 accessible = accessible.where(
@@ -2538,6 +2555,7 @@ def create_app(settings=None):
                 "pending": count_documents(pending_condition),
                 "linked": count_documents(linked_condition),
                 "attention": count_documents(attention_condition),
+                "work": count_documents(or_(pending_condition, attention_condition)),
             }
             filtered = accessible
             if status == "pending":
@@ -2546,6 +2564,8 @@ def create_app(settings=None):
                 filtered = filtered.where(linked_condition)
             elif status == "attention":
                 filtered = filtered.where(attention_condition)
+            elif status == "work":
+                filtered = filtered.where(or_(pending_condition, attention_condition))
             if product_id:
                 filtered = filtered.where(
                     or_(
@@ -2783,6 +2803,288 @@ def create_app(settings=None):
             )
         return {**page_result, "items": result} if page_result else result
 
+    @app.get("/api/managers/{manager_id}/material-workspace")
+    def material_workspace(
+        manager_id: str,
+        actor=Depends(user),
+        session=Depends(db, scope="function"),
+    ):
+        permissions = require(session, actor, manager_id, "archive")
+        documents = list(
+            session.scalars(
+                select(Document).where(
+                    Document.manager_id == manager_id,
+                    ~func.lower(Document.filename).like("%.eml"),
+                    ~Document.id.in_(
+                        select(DocumentMaterial.document_id).where(
+                            DocumentMaterial.manager_id == manager_id,
+                            DocumentMaterial.organization_source.in_(["automatic", "system_parse"]),
+                            or_(
+                                DocumentMaterial.category == "nav_valuation",
+                                DocumentMaterial.material_type == "position_statement",
+                            ),
+                        )
+                    ),
+                )
+            )
+        )
+        document_ids = [document.id for document in documents]
+        materials = {
+            material.document_id: material
+            for material in session.scalars(
+                select(DocumentMaterial).where(
+                    DocumentMaterial.document_id.in_(document_ids)
+                )
+            )
+        } if document_ids else {}
+        if not permissions["investor_read"]:
+            mail_root_ids = {document.parent_id or document.id for document in documents}
+            sensitive_mail_roots = set(
+                session.scalars(
+                    select(MailItem.document_id).where(
+                        MailItem.manager_id == manager_id,
+                        MailItem.document_id.in_(mail_root_ids),
+                        MailItem.category == "investor_redemption",
+                    )
+                )
+            ) if mail_root_ids else set()
+            documents = [
+                document
+                for document in documents
+                if (document.parent_id or document.id) not in sensitive_mail_roots
+                and (
+                    materials.get(document.id) is None
+                    or materials[document.id].sensitivity != "investor_sensitive"
+                )
+            ]
+            document_ids = [document.id for document in documents]
+
+        product_links = {}
+        for link in session.scalars(
+            select(DocumentMaterialProduct).where(
+                DocumentMaterialProduct.document_id.in_(document_ids)
+            )
+        ) if document_ids else []:
+            product_links.setdefault(link.document_id, set()).add(link.product_id)
+        investor_links = {}
+        for link in session.scalars(
+            select(DocumentMaterialInvestor).where(
+                DocumentMaterialInvestor.document_id.in_(document_ids)
+            )
+        ) if document_ids else []:
+            investor_links.setdefault(link.document_id, set()).add(link.investor_id)
+        jobs = {
+            job.document_id: job
+            for job in session.scalars(
+                select(ParseJob).where(ParseJob.document_id.in_(document_ids))
+            )
+        } if document_ids else {}
+
+        products = list(
+            session.scalars(
+                product_query(session, actor, manager_id).where(
+                    Product.lifecycle_status.notin_(["liquidated", "archived"])
+                )
+            )
+        )
+        product_ids = {product.id for product in products}
+        investors = list(
+            session.scalars(select(Investor).where(Investor.manager_id == manager_id))
+        ) if permissions["investor_read"] else []
+        investor_ids = {investor.id for investor in investors}
+        investor_status_by_id = {investor.id: investor.status for investor in investors}
+
+        product_stats = {
+            product_id: {"material_count": 0, "attention_count": 0, "relations": set()}
+            for product_id in product_ids
+        }
+        investor_stats = {
+            investor_id: {
+                "material_count": 0,
+                "attention_count": 0,
+                "relations": set(),
+                "checklist_counts": {},
+            }
+            for investor_id in investor_ids
+        }
+        relation_stats = {}
+        for relation in session.scalars(
+            select(InvestorProduct).where(InvestorProduct.manager_id == manager_id)
+        ) if permissions["investor_read"] else []:
+            if relation.product_id not in product_ids or relation.investor_id not in investor_ids:
+                continue
+            product_stats[relation.product_id]["relations"].add(relation.investor_id)
+            investor_stats[relation.investor_id]["relations"].add(relation.product_id)
+            relation_stats[(relation.product_id, relation.investor_id)] = {
+                "material_count": 0,
+                "attention_count": 0,
+                "holding_status": "confirmed",
+                "relation_source": "administrator",
+                "current_units": None,
+                "as_of_date": None,
+            }
+
+        # Derive display status from row-level business evidence.  Only the
+        # latest snapshot for each share participates in current holdings;
+        # older positive rows still preserve a historical investment relation.
+        latest_snapshots = {}
+        for snapshot in session.scalars(
+            select(InvestorPositionSnapshot)
+            .where(
+                InvestorPositionSnapshot.manager_id == manager_id,
+                InvestorPositionSnapshot.investor_id.in_(investor_ids),
+                InvestorPositionSnapshot.product_id.in_(product_ids),
+            )
+            .order_by(
+                InvestorPositionSnapshot.as_of_date,
+                InvestorPositionSnapshot.created_at,
+                InvestorPositionSnapshot.id,
+            )
+        ) if relation_stats else []:
+            key = (snapshot.product_id, snapshot.investor_id, snapshot.share_id)
+            latest_snapshots[key] = snapshot
+        snapshots_by_relation = {}
+        for (product_id, investor_id, _), snapshot in latest_snapshots.items():
+            snapshots_by_relation.setdefault((product_id, investor_id), []).append(snapshot)
+
+        confirmed_events = {}
+        for event in session.scalars(
+            select(InvestorShareEvent)
+            .where(
+                InvestorShareEvent.manager_id == manager_id,
+                InvestorShareEvent.status == "confirmed",
+                InvestorShareEvent.investor_id.in_(investor_ids),
+                InvestorShareEvent.product_id.in_(product_ids),
+            )
+            .order_by(InvestorShareEvent.created_at, InvestorShareEvent.id)
+        ) if relation_stats else []:
+            confirmed_events.setdefault((event.product_id, event.investor_id), []).append(event)
+
+        for key, values in relation_stats.items():
+            snapshots = snapshots_by_relation.get(key, [])
+            if snapshots:
+                units = sum((snapshot.units for snapshot in snapshots), Decimal("0"))
+                values.update(
+                    holding_status="active" if units > 0 else "historical",
+                    relation_source="position",
+                    current_units=str(units),
+                    as_of_date=max(snapshot.as_of_date for snapshot in snapshots),
+                )
+                continue
+            events = confirmed_events.get(key, [])
+            if not events:
+                continue
+            dated_events = sorted(
+                events,
+                key=lambda event: (
+                    event.effective_date or event.confirmation_date or event.application_date or "",
+                    event.created_at,
+                    event.id,
+                ),
+            )
+            latest_balance = next(
+                (event.balance_after for event in reversed(dated_events) if event.balance_after is not None),
+                None,
+            )
+            units = latest_balance
+            if units is None:
+                deltas = [event.units_delta for event in dated_events if event.units_delta is not None]
+                units = sum(deltas, Decimal("0")) if deltas else None
+            values.update(
+                holding_status="active" if units is not None and units > 0 else "historical",
+                relation_source="transaction",
+                current_units=str(units) if units is not None else None,
+                as_of_date=max(
+                    (
+                        event.effective_date
+                        or event.confirmation_date
+                        or event.application_date
+                        or ""
+                        for event in dated_events
+                    ),
+                    default="",
+                ) or None,
+            )
+
+        checklist_rules = {
+            "commitment": ({"qualified_investor_commitment"}, ("合格投资者承诺",)),
+            "risk": ({"risk_questionnaire"}, ("风险测评", "风险评估", "评估问卷", "测评问卷")),
+            "information": ({"investor_information_form"}, ("投资者信息表", "投资者基本信息表")),
+            "identity": ({"identity_front", "identity_back", "identity_document"}, ("身份证", "身份证明", "证件照片")),
+            "assets": ({"asset_proof"}, ("资产规模", "资产证明", "收入证明", "金融资产")),
+            "institution": ({"institution_certificate"}, ("营业执照", "许可证", "机构证明")),
+            "representative": ({"representative_identity", "authorization"}, ("法人身份证", "法定代表人", "经办人", "授权委托")),
+            "filing": ({"product_filing_certificate"}, ("备案函", "备案证明", "产品证明")),
+            "tax": ({"tax_declaration"}, ("税收", "税务", "居民身份声明")),
+            "professional": ({"professional_investor_proof"}, ("专业投资者",)),
+            "specific": ({"special_object_confirmation"}, ("特定对象",)),
+        }
+
+        for document in documents:
+            material = materials.get(document.id)
+            linked_products = (
+                product_links.get(document.id, set())
+                if material
+                else ({document.product_id} if document.product_id else set())
+            ) & product_ids
+            linked_investors = investor_links.get(document.id, set()) & investor_ids
+            attention = (
+                material is None
+                or material.status != "organized"
+                or jobs.get(document.id) is not None
+                and jobs[document.id].status in {"queued", "processing", "review"}
+            )
+            for product_id in linked_products:
+                product_stats[product_id]["material_count"] += 1
+                product_stats[product_id]["attention_count"] += int(attention)
+            for investor_id in linked_investors:
+                investor_stats[investor_id]["material_count"] += 1
+                investor_stats[investor_id]["attention_count"] += int(attention)
+                haystack = f"{document.filename} {material.title if material else ''}".lower()
+                material_type = material.material_type if material else None
+                for key, (types, patterns) in checklist_rules.items():
+                    if material_type in types or any(pattern.lower() in haystack for pattern in patterns):
+                        counts = investor_stats[investor_id]["checklist_counts"]
+                        counts[key] = counts.get(key, 0) + 1
+            for product_id in linked_products:
+                for investor_id in linked_investors:
+                    relation = relation_stats.get((product_id, investor_id))
+                    if relation is None:
+                        continue
+                    relation["material_count"] += 1
+                    relation["attention_count"] += int(attention)
+
+        return {
+            "products": [
+                {
+                    "id": product_id,
+                    "material_count": values["material_count"],
+                    "attention_count": values["attention_count"],
+                    "relation_count": len(values["relations"]),
+                }
+                for product_id, values in product_stats.items()
+            ],
+            "investors": [
+                {
+                    "id": investor_id,
+                    "material_count": values["material_count"],
+                    "attention_count": values["attention_count"]
+                    + int(investor_status_by_id[investor_id] == "pending"),
+                    "relation_count": len(values["relations"]),
+                    "checklist_counts": values["checklist_counts"],
+                }
+                for investor_id, values in investor_stats.items()
+            ],
+            "relations": [
+                {
+                    "product_id": product_id,
+                    "investor_id": investor_id,
+                    **values,
+                }
+                for (product_id, investor_id), values in relation_stats.items()
+            ],
+        }
+
     @app.put("/api/documents/{document_id}/material")
     def organize_document(
         document_id: str,
@@ -2999,6 +3301,41 @@ def create_app(settings=None):
             filename=doc.filename,
             media_type="application/octet-stream",
             content_disposition_type="attachment",
+        )
+
+    @app.get("/api/documents/{document_id}/preview")
+    def preview_document(
+        document_id: str, actor=Depends(user), session=Depends(db, scope="function")
+    ):
+        doc = get_document(session, actor, document_id)
+        require(session, actor, doc.manager_id, "download")
+        path = settings.storage / doc.storage_key
+        if not path.is_file():
+            raise HTTPException(503, "归档原件暂不可用，请联系管理员")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != doc.sha256:
+            raise HTTPException(503, "原件完整性校验失败，已阻止查看，请联系管理员")
+        audit(session, actor, doc.manager_id, "document.previewed", doc.id)
+        suffix = Path(doc.filename).suffix.lower()
+        inline_types = {
+            ".pdf": "application/pdf",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+        }
+        if suffix in inline_types:
+            return FileResponse(
+                path,
+                filename=doc.filename,
+                media_type=inline_types[suffix],
+                content_disposition_type="inline",
+                headers={"X-Content-Type-Options": "nosniff"},
+            )
+        return HTMLResponse(
+            render_document_preview(path, doc.filename),
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     @app.post("/api/documents/{document_id}/reparse")
@@ -3568,7 +3905,7 @@ def create_app(settings=None):
         offset: int = Query(0, ge=0),
         limit: int = Query(50, ge=1, le=500),
         q: str = Query("", max_length=500),
-        view: str = Query("all", pattern="^(all|action|completed|receipt|pending)$"),
+        view: str = Query("all", pattern="^(inbox|all|action|completed|receipt|pending)$"),
         actor=Depends(user), session=Depends(db, scope="function"),
     ):
         permissions = require(session, actor, manager_id, "archive")
@@ -3584,6 +3921,26 @@ def create_app(settings=None):
             query = query.where(MailItem.document_id.in_(
                 select(MailReceipt.document_id).where(MailReceipt.mailbox_id == mailbox_id)
             ))
+        if view == "inbox" and not q.strip() and not item_id:
+            completed_actions = select(MailAction.mail_item_id).where(
+                MailAction.status == "completed"
+            )
+            review_mail_roots = (
+                select(Document.parent_id)
+                .join(ParseJob, ParseJob.document_id == Document.id)
+                .where(
+                    Document.manager_id == manager_id,
+                    Document.parent_id.is_not(None),
+                    ParseJob.status == "review",
+                )
+            )
+            query = query.where(
+                ~MailItem.id.in_(completed_actions),
+                or_(
+                    MailItem.category != "nav_valuation",
+                    MailItem.document_id.in_(review_mail_roots),
+                ),
+            )
         if view in {"action", "completed"}:
             query = query.where(MailItem.id.in_(select(MailAction.mail_item_id).where(
                 MailAction.status == ("open" if view == "action" else "completed")
@@ -3600,6 +3957,13 @@ def create_app(settings=None):
                 MailItem.id.in_(select(MailItemProduct.mail_item_id).join(
                     Product, Product.id == MailItemProduct.product_id
                 ).where(Product.name.contains(needle, autoescape=True))),
+                MailItem.document_id.in_(
+                    select(Document.parent_id).where(
+                        Document.manager_id == manager_id,
+                        Document.parent_id.is_not(None),
+                        Document.filename.contains(needle, autoescape=True),
+                    )
+                ),
             ))
         total = session.scalar(select(func.count()).select_from(query.subquery())) if paginated else 0
         items = list(session.scalars(query.order_by(

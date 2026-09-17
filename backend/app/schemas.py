@@ -299,6 +299,7 @@ class InvestorSave(Strict):
     source: Literal["manual", "directory_reference", "material"] = "manual"
     product_ids: list[str] = Field(default_factory=list, max_length=500)
     notes: str = Field(default="", max_length=2000)
+    correction_reason: str | None = Field(default=None, max_length=500)
 
     @field_validator("product_ids")
     @classmethod

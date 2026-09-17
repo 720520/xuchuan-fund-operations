@@ -388,7 +388,12 @@ def test_ingest_routes_only_nav_attachments_and_completes_mail_action(env):
     with app.state.factory.begin() as db:
         box = mailbox(db, ids["a"])
         nav_id = ingest_message(
-            db, app.state.settings, box, "1", "1", message("产品估值表").as_bytes()
+            db,
+            app.state.settings,
+            box,
+            "1",
+            "1",
+            message("产品估值表", attachment="净值明细.xlsx").as_bytes(),
         )
         security_id = ingest_message(
             db,
@@ -427,11 +432,23 @@ def test_ingest_routes_only_nav_attachments_and_completes_mail_action(env):
     listed = client.get(f"/api/managers/{ids['a']}/mail-items")
     assert listed.status_code == 200
     assert len(listed.json()) == 2
+    inbox = client.get(
+        f"/api/managers/{ids['a']}/mail-items", params={"view": "inbox"}
+    ).json()
+    assert [item["id"] for item in inbox] == [security_item.id]
+    searched = client.get(
+        f"/api/managers/{ids['a']}/mail-items",
+        params={"view": "inbox", "q": "净值明细.xlsx"},
+    ).json()
+    assert [item["id"] for item in searched] == [nav_item.id]
     completed = client.post(
         f"/api/mail-actions/{action_id}/complete",
         json={"revision": revision, "reason": "已核查，确认为本人登录"},
     )
     assert completed.status_code == 200
+    assert client.get(
+        f"/api/managers/{ids['a']}/mail-items", params={"view": "inbox"}
+    ).json() == []
 
 
 def test_backfill_skips_previously_queued_non_nav_attachment(env):
@@ -456,7 +473,7 @@ def test_backfill_skips_previously_queued_non_nav_attachment(env):
     with app.state.factory() as db:
         job = db.scalar(select(ParseJob).where(ParseJob.document_id == child_id))
         assert job.status == "skipped"
-        assert "不是净值或估值" in job.result["reason"]
+        assert "正式原件" in job.result["reason"]
         item = db.scalar(select(MailItem).where(MailItem.document_id == original.id))
         item_id, revision = item.id, item.revision
     login(client)
@@ -472,7 +489,8 @@ def test_backfill_skips_previously_queued_non_nav_attachment(env):
     assert corrected.status_code == 200
     with app.state.factory() as db:
         job = db.scalar(select(ParseJob).where(ParseJob.document_id == child_id))
-        assert job.status == "queued"
+        assert job.status == "skipped"
+        assert "正式原件" in job.result["reason"]
 
 
 def test_daily_folder_scan_excludes_special_mail_folders():

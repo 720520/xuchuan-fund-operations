@@ -5,6 +5,8 @@ from app.models import (
     AuditEvent,
     Document,
     DocumentMaterial,
+    DocumentMaterialInvestor,
+    DocumentMaterialProduct,
     ExceptionTask,
     Investor,
     InvestorBankAccount,
@@ -700,10 +702,39 @@ def test_custodian_position_statement_auto_imports_and_is_idempotent(env):
         assert material.material_type == "position_statement"
         assert material.sensitivity == "investor_sensitive"
         assert material.organization_source == "automatic"
+        assert db.scalar(
+            select(DocumentMaterialInvestor).where(
+                DocumentMaterialInvestor.document_id == attachment_id
+            )
+        ) is None
+        assert db.scalar(
+            select(DocumentMaterialProduct).where(
+                DocumentMaterialProduct.document_id == attachment_id
+            )
+        ) is None
+
+    materials = client.get(
+        f"/api/managers/{ids['a']}/documents",
+        params={"paginated": "true"},
+    ).json()
+    assert attachment_id not in {item["id"] for item in materials["items"]}
 
     investors = client.get(f"/api/managers/{ids['a']}/investors").json()
     imported = next(item for item in investors if item["id"] == investor.id)
     assert imported["product_ids"] == [owned_product["id"]]
+    workspace = client.get(
+        f"/api/managers/{ids['a']}/material-workspace"
+    ).json()
+    relation = next(
+        item
+        for item in workspace["relations"]
+        if item["investor_id"] == investor.id
+        and item["product_id"] == owned_product["id"]
+    )
+    assert relation["holding_status"] == "active"
+    assert relation["relation_source"] == "position"
+    assert relation["current_units"] == "123456.780000"
+    assert relation["as_of_date"] == "2026-09-15"
     ledger = client.get(f"/api/investors/{investor.id}/share-events").json()
     assert ledger["positions"][0]["current_units"] == "123456.780000"
     assert ledger["positions"][0]["current_source"] == "snapshot"

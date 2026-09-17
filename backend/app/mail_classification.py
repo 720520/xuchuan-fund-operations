@@ -20,7 +20,9 @@ from .models import (
 )
 
 
-SUPPORTED_NAV_ATTACHMENTS = (".xlsx", ".xls", ".csv", ".pdf", ".xlsm")
+# Structured data files enter the NAV parser.  A PDF is a formal original for
+# review/archiving even when it arrives in the same valuation email.
+SUPPORTED_NAV_ATTACHMENTS = (".xlsx", ".xls", ".csv", ".xlsm")
 
 
 class _TextExtractor(HTMLParser):
@@ -569,9 +571,16 @@ def _route_attachments(db, original, nav_candidate):
         db.scalars(select(Document).where(Document.parent_id == original.id))
     )
     for child in attachments:
-        if not child.filename.lower().endswith(SUPPORTED_NAV_ATTACHMENTS):
-            continue
         job = db.scalar(select(ParseJob).where(ParseJob.document_id == child.id))
+        if not child.filename.lower().endswith(SUPPORTED_NAV_ATTACHMENTS):
+            if job and job.status == "queued":
+                job.status = "skipped"
+                job.updated_at = now()
+                job.result = {
+                    "errors": [],
+                    "reason": "该附件作为正式原件保留，不进入结构化数据解析",
+                }
+            continue
         duplicate_job = db.scalar(
             select(ParseJob)
             .join(Document, Document.id == ParseJob.document_id)

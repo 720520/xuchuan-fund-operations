@@ -183,6 +183,13 @@ def test_upload_parse_durable_idempotent_and_download_scope(env):
     response = client.get(f"/api/documents/{doc['id']}/download")
     assert response.content == content
     assert "attachment" in response.headers["content-disposition"]
+    preview = client.get(f"/api/documents/{doc['id']}/preview")
+    assert preview.status_code == 200
+    assert preview.headers["content-type"].startswith("text/html")
+    assert "产品代码" in preview.text
+    assert "default-src 'none'" in preview.headers["content-security-policy"]
+    assert "frame-ancestors 'self'" in preview.headers["content-security-policy"]
+    assert preview.headers["x-frame-options"] == "SAMEORIGIN"
     assert client.post(f"/api/documents/{doc['id']}/reparse").status_code == 200
     run_once(app.state.factory, app.state.settings)
     with app.state.factory() as db:
@@ -197,6 +204,7 @@ def test_upload_parse_durable_idempotent_and_download_scope(env):
         ) == p["id"]
     login(client, "colleague")
     assert client.get(f"/api/documents/{doc['id']}/download").status_code == 403
+    assert client.get(f"/api/documents/{doc['id']}/preview").status_code == 403
     login(client, "otherops")
     assert client.get(f"/api/managers/{ids['a']}/documents").status_code == 403
     assert client.get(f"/api/documents/{doc['id']}/download").status_code == 403
